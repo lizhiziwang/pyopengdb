@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "pyopenfilegdb"
 version = "0.1.0"
 description = "纯 Python 实现的 Esri FileGDB(.gdb)读写库,带可选的 C 加速模块"
-readme = "DESIGN.md"
+readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
 keywords = ["gdb", "filegdb", "esri", "arcgis", "gis", "geospatial"]
