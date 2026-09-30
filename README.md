@@ -36,7 +36,6 @@ with OpenFileGDB.open('D:/data/2024年国土行政区划.gdb') as gdb:
 - [与 GDAL 的关系、以及刻意的边界](#与-gdal-的关系以及刻意的边界)
 - [验证](#验证)
 - [仓库结构](#仓库结构)
-
 ---
 
 ## 安装
@@ -44,6 +43,8 @@ with OpenFileGDB.open('D:/data/2024年国土行政区划.gdb') as gdb:
 ```bash
 pip install .                       # 纯 Python,零运行时依赖
 pip install .[speed]                # 附带 numpy(可选加速器,见下)
+pip install .[crs]                  # 附带 pyproj(坐标转换,见下)
+pip install .[all]                  # 两个都要
 ```
 
 要求 Python ≥ 3.9。**可选 C 扩展不编也能跑**,只是慢(见[性能](#性能));
@@ -112,6 +113,17 @@ layer.delete_feature(oid)
 gdb.close()
 ```
 
+改要素走 **读→改→写回**:`update_feature()` 是**整条记录替换**(对应 GDAL
+`ISetFeature`),`attributes` 里没提到的字段会按字段定义落默认值/空值 —— 所以
+只改一两个字段要先 `read_feature(oid)` 拿回完整的一条(它自带 `oid`)。
+
+⚠️ **OID 在 `feature.oid` 上,不在 `attributes` 里**(等价于 OGR 的 FID,
+读回来的 `attributes` 本来就不含 `OBJECTID`)。传 `GdbFeature` 给
+`write_feature()` 时新 OID 会**写回** `feature.oid`(照 GDAL
+`ICreateFeature` 结尾的 `poFeature->SetFID()`),所以 `write_feature(feat)`
+之后可以直接 `update_feature(feat)`;传 dict 则取返回值。字段定义里**没有**的
+键会被**静默忽略**,写错名字不会报错 —— 只会发现值没进去。
+
 建出来的库**可以直接用 ArcGIS / QGIS 打开** —— 七张系统表与真实 ArcGIS 空白库
 逐段字节一致(有测试守着)。
 
@@ -135,6 +147,18 @@ g.distance(other)     # O(n·m),无 bbox 预筛
 # 构造(返回新的 Geometry)
 g.convex_hull() / .simplify(tolerance) / .segmentize(max_len)
 
+# 缓冲区 —— 按 JTS/GEOS 算法自实现(结果恒 2D、Esri 绕向)
+g.buffer(50)                       # 圆角圆帽,quad_segs=8
+g.buffer(50, cap='flat')           # round / flat / square(也收 1/2/3)
+g.buffer(50, join='mitre', mitre_limit=5.0)   # round / mitre / bevel
+g.buffer(-20)                      # 负数 = 侵蚀
+g.buffer(50, single_sided=True)    # 单侧(⚠️ 闭合输入上与 GEOS 不同,见下)
+
+# overlay 四算子 —— 同样按 JTS/GEOS 自实现(结果恒 2D、Esri 绕向)
+a.difference(b) / .union(b) / .intersection(b)
+a.symmetric_difference(b)          # 别名 a.sym_difference(b)
+# 混维度结果会给出 GEOMETRYCOLLECTION(纯内存类型,⚠️ 写不进 .gdb)
+
 # 拓扑判定 —— relate() 直接给 9 位 DE-9IM 矩阵
 g.relate(other)                                       # '212101212'
 g.intersects / .disjoint / .contains / .within
@@ -157,6 +181,56 @@ g.to_geojson() / g.__geo_interface__                  # 可直接喂 geopandas/f
 > ```
 > GDAL 的 Python 绑定把这两个都叫 `Equals`,是结构比较;GEOS 的 `equals` 才是拓扑。
 > 本库用两个名字分开,免得踩坑。
+
+### 坐标转换(可选,需要 pyproj)
+
+`geometry.to_crs()` 转**一条**几何,`transform_layer()` 转**一个图层**。
+走 [pyproj](https://pyproj4.github.io/pyproj/)(PROJ 的绑定),不碰 GDAL。
+
+```python
+from pyopenfilegdb import OpenFileGDB, Geometry
+from pyopenfilegdb.coordinates_system import (create_transformed_layer,
+                                              transform_layer,
+                                              transformer_description,
+                                              write_transformed)
+
+# 一条几何:源坐标系必须显式给 —— 几何自己不知道自己是什么坐标系
+g = Geometry.from_wkt('POINT(39394370.79 3179362.10)')     # CGCS2000 3 度带 zone 39
+g.to_crs(4326, src=4527).wkt()
+# 'POINT (115.91881971302487 28.725838734163123)'          # 经度, 纬度
+g.to_crs(4326, src=4527).coordinates      # (115.91881971302487, 28.725838734163123)
+
+# 一个图层:逐条产出**新**要素,不写盘,惰性解码
+with OpenFileGDB.open('D:/data/x.gdb') as gdb:
+    for feat in transform_layer(gdb.get_layer('村行政区划'), 4326):
+        ...                       # feat.geometry 已经是经纬度
+
+# 落盘:建同构图层 + 逐条写
+with OpenFileGDB.open('D:/data/x.gdb') as src_db, \
+     OpenFileGDB.create('D:/data/x_wgs84.gdb') as dst_db:
+    src = src_db.get_layer('村行政区划')
+    dst = create_transformed_layer(src, dst_db, 4326)
+    write_transformed(src, dst, 4326)      # 返回写入条数
+```
+
+也可以当命令行脚本跑:
+
+```bash
+python -m pyopenfilegdb.coordinates_system 源.gdb 村行政区划 目标.gdb 4326 --limit 1000
+```
+
+**四个必须知道的行为**(都写在模块 docstring 里,都有测试守着):
+
+| | |
+|---|---|
+| **轴序固定 lon/lat** | 一律 `always_xy=True`。去掉它之后 EPSG:4326 会按(纬度, 经度)的权威轴序解释,实测**静默**返回 `(inf, inf)` |
+| **`errcheck` 拦不住域外点** | 实测把域外坐标喂进去,`errcheck=True` **不报错**,只给你一个有限但完全错误的数。所以本库自己做**量级体检**:源是地理坐标系却给出 ±180 以外的坐标(或反之)就发 `CoordTransformWarning`。这是**告警不是异常**,`check=False` 可关 |
+| **返回新几何,不就地改** | ⚠️ 与 `OGRGeometry::Transform()` **相反**。本库的要素把解码后的几何缓存在 `feat.geometry` 上,就地改会静默污染那个缓存(盘上没变,再取一次却是改过的) |
+| **可能只是 "Ballpark"** | CGCS2000 → WGS84 之间没装改化格网时,pyproj 会如实写明 `Ballpark geographic offset`。同一对连线的描述可以打出来看一眼:`transformer_description(layer, 4326)` |
+
+几何语义:Z 一并转(**二维转换器对 Z 是原样透传**,交给 pyproj 判断)、M 原样保留、
+multipatch 允许转(逐点操作,不依赖"环"模型,没有谓词那种语义鸿沟)、
+环在内存里本就不闭合所以也不用补点。
 
 ---
 
@@ -184,8 +258,16 @@ g.to_geojson() / g.__geo_interface__                  # 可直接喂 geopandas/f
 
 ### 几何空间计算 ✅
 
-度量与描述、构造型(凸包 / Douglas-Peucker 简化 / segmentize)、
-DE-9IM 拓扑判定、WKT + GeoJSON 出口。
+度量与描述、构造型(凸包 / Douglas-Peucker 简化 / segmentize / **buffer** /
+**overlay 四算子**)、DE-9IM 拓扑判定、WKT + GeoJSON 出口。`buffer` 与
+`difference` / `union` / `intersection` / `symmetric_difference`(别名
+`sym_difference`)都按 GEOS 的上游 JTS 逐段复刻,并分别与 GEOS 3.13.1 对拍留数
+(见[边界](#与-gdal-的关系以及刻意的边界))。
+
+### 坐标转换 ✅(可选,需要 pyproj)
+
+`Geometry.to_crs()` / `transform_layer()` / `create_transformed_layer()` +
+`write_transformed()` + 命令行。见[快速上手](#坐标转换可选需要-pyproj)。
 
 ---
 
@@ -257,6 +339,13 @@ numpy **不在 `dependencies` 里**,只在 `[project.optional-dependencies] spee
 ⚠️ **依赖符号的路径一律不走 numpy** —— 环方向判定用成对求和还是顺序累加,
 在近零面积环上符号可能翻,而那是**写盘正确性**,不是性能问题。
 
+### 3. 还有 pyproj —— 但那个不是"加速器"
+
+坐标转换靠 pyproj(见[快速上手](#坐标转换可选需要-pyproj))。它和前两个**性质不同**:
+numpy 与 C 扩展是"有就快些、没有照样全功能",pyproj 是**"没有就没有这个功能"**。
+所以它单独占一个 extra(`[crs]`),没装不影响读写,只是 `to_crs()` 会用不了并给出
+一句带安装命令的 `ImportError`;CLI 则直接 `exit 2` 并说明原因。
+
 ---
 
 ## 与 GDAL 的关系、以及刻意的边界
@@ -265,14 +354,38 @@ numpy **不在 `dependencies` 里**,只在 `[project.optional-dependencies] spee
 |---|---|
 | **格式读写** | 严格按 GDAL `openfilegdb` 实现,包括它那些反直觉的地方 |
 | **拓扑谓词** | ⚠️ **例外。** `OGRGeometry::Intersects` / `Contains` / `Touches`… 在 GDAL 里**全部转手给 GEOS**,没有纯 C++ 可抄。本库按 OGC DE-9IM 规范自实现 |
+| **`buffer`** | ⚠️ **同一个例外。** `OGRGeometry::Buffer` 也是一句转发给 GEOS 的话,GDAL 自己一行算法都没有。本库按 **GEOS 的上游 JTS**(`operation/buffer/*`)逐段复刻,并在上游分岔处以 **GEOS 为准**(共 5 处,见 DESIGN.md §2.23) |
+| **overlay 四算子** | ⚠️ **还是这个例外。** `Difference` / `Union` / `Intersection` / `SymmetricDifference` 在 GDAL 里同样只是转发给 GEOS,所以按 **JTS `operation/overlayng/*`** 复刻。**算法上与 `buffer` 共用一套平面图**(`_planar.py`),差异都记在 DESIGN.md §2.24 |
+| **坐标转换** | 与 GDAL 同一个来源:GDAL 的 `OGRCoordinateTransformation` 内部调的也是 **PROJ**,本库通过 pyproj 调同一个 PROJ。⚠️ 但这是**可选**功能,且不做 GDAL 那套 `OGRCreateCoordinateTransformation` 的坐标系推测(本库要求你显式给出源坐标系) |
 
 这一档的诚实边界:
 
 - **无 snap-rounding、无精确算术。** 用浮点方向判定,次 ULP 的退化构型可能判错。
   已知的一处:1e-9 高的薄片平移到 UTM 量级后只有 2.1 ULP 高,穿过它的子线段比一个
   ULP 还短,双精度网格上没有内部点可采样。GEOS 靠**组合式**拓扑图躲过,采样式实现躲不过。
-- **不做 overlay** —— `buffer` / `union` / `intersection` / `difference` /
-  `sym_difference` 需要 GEOS 级精度模型,刻意不实现。
+- **`buffer` 与 overlay 四个算子都已实现,但都不是"GEOS 级"。** `buffer(distance,
+  quad_segs=8, cap=..., join=..., mitre_limit=5.0, single_sided=False)`;
+  overlay 是 `difference` / `union` / `intersection` / `symmetric_difference`
+  (`sym_difference` 别名)。两者都按 GEOS 的上游 **JTS** 逐段复刻
+  (`operation/buffer/*` 与 `operation/overlayng/*`),并各自与 GEOS 3.13.1 对拍留数
+  (`tools/verify_buffer.py` / `tools/verify_overlay.py`)。
+  `buffer` 自己的边界:① **无 snap-rounding** —— 只有靠它才能救回来的退化构型,
+  GEOS 给结果而本库给空多边形;② 结果**恒为 2D**(Z/M 丢弃);③ 输出环是 **Esri
+  绕向**(外壳 CW、洞 CCW);④ `multipatch` 输入抛 `NotImplementedError`;
+  ⑤ **闭合输入(面 / 闭合折线)上的 `single_sided` 与 GDAL/GEOS 不同** —— GEOS 之后
+  还有一步 `OverlayNG` + `Polygonizer`(取最大面),本库按 JTS 返回单侧缓冲。
+  overlay 自己的边界:① 同样**无 snap-rounding**;② 与 GEOS **不逐位相同**(算出来的
+  交点可能差 1 ulp),判定用"对称差面积 + 两结果总长之差 + Hausdorff"三条腿,不用
+  对称差线长(GEOS 对近重合输入的对称差自身不稳);③ 结果同为 **Esri 绕向**;
+  ④ 线结果**逐条节点边**输出(JTS 口径),GEOS 会合并成最长链,故对拍里那 44 对
+  **列出原因与条数**排除;⑤ `GEOMETRYCOLLECTION` 是**纯内存**的结果类型,**写不进
+  `.gdb`**;⑥ `multipatch` 与"输入含 GC"的处理各有明说的边界,见 `DESIGN.md` §2.24。
+  与 GEOS 的对拍:`tools/verify_buffer.py` **1096 对**,逐位完全相同 **1015 对(92.6%)**,
+  **0 对超差**,44 对按上一条(闭合输入的单侧缓冲)列明原因后排除;
+  `tools/verify_overlay.py` **1264 对**,集合与结构全同 **1220 对**(其中对称差严格为空
+  1205 对),**0 对超差**,44 对按"线结果逐条节点边输出"列明原因后排除。
+  实测性能:`buffer` 在行政区语料取前 200 条(约 2.5 万顶点)、`d=50 m` 下约
+  **74–109 ms/条**(见 DESIGN §2.23);overlay 在同一个语料上约 **5~6 ms/算子**。
 - **`is_valid()` / `is_simple()` 是部分实现。** 只查:环是否闭合、顶点数是否满足类型
   下限、**单环自交**、洞是否落在壳内。**没查**的:洞之间的互不包含、multipoint 互不重合等。
   所以 `is_valid() == True` **不等于** OGC 有效 —— 这条写在 docstring 里,别当成全量校验。
@@ -280,6 +393,13 @@ numpy **不在 `dependencies` 里**,只在 `[project.optional-dependencies] spee
 - **GeoJSON 不按 RFC 7946 重绕环**(与 `OGR_G_ExportToJson` 默认一致 —— Esri 的绕向与
   RFC 7946 恰好相反),**且丢弃 M**(JSON 里没有 M 的位置)。
 - **`extent` 是单调上界**,不是真实范围 —— 这是 ArcGIS 自己的语义,删要素后不会回缩。
+- **坐标转换的两个边界。** (1) 目标图层的**量化参数是本库推导的**,不是从 GDAL
+  抄的 —— GDAL 那边由创建选项或 ArcGIS 决定,没有纯 C++ 规则可抄。本库的规则
+  复现了参照语料里 ArcGIS 自己写的值(投影档 `xy_scale=20000`/`xy_tolerance=1e-4`),
+  但不敢说与 ArcGIS 在所有数据上都选得一样;差别只在文件体积与末位精度。
+  (2) 精度受**目标坐标系**的默认量化限制:转到地理坐标系是 `2e-6` 度(≈ 0.2 m),
+  这是 FileGDB + ArcGIS 的默认值,不是本库选的;要更细用 `quantization=` 覆盖。
+  另外 **不做基准面改化** —— 没装 PROJ 的格网文件时就是 `Ballpark`,见上文。
 - **不写 `.atx` / `.spx` / `.freelist`**,`.atx`/`.spx` 查询是桩。不写也能正常读。
 - 写回**不是逐位幂等**的:全语料 21,217 条做"读→写→读",152 条(0.7%)字节不同,
   来自环顺序/绕向规范化加 ≤1 个量化步长的舍入。**面积全部一致**,是表示差异不是几何差异。
@@ -289,21 +409,36 @@ numpy **不在 `dependencies` 里**,只在 `[project.optional-dependencies] spee
 
 ## 验证
 
-**155 个用例,四配置全绿**(改一个全局名字最容易漏掉某个引用点,所以每条都过):
+**383 个用例,四配置全绿**(改一个全局名字最容易漏掉某个引用点,所以每条都过):
 
 ```bash
-P="D:/zsh/app/py_3.13.1/python"                      # 带 numpy
-V="E:/code/pyopenfilegdb/.venv/Scripts/python.exe"   # 3.11.9,无 numpy
-PYTHONIOENCODING=utf-8 $P -m unittest discover -s tests        # 155 OK      33.9 s
+P="D:/zsh/app/py_3.13.1/python"                      # 带 numpy + pyproj
+V="E:/code/pyopenfilegdb/.venv/Scripts/python.exe"   # 3.11.9
+PYTHONIOENCODING=utf-8 $P -m unittest discover -s tests        # 383 OK      33.9 s
 PYOPENFILEGDB_NO_NUMPY=1 PYTHONIOENCODING=utf-8 $P -m unittest discover -s tests
-#                                                              # 155 OK(skipped=5)
-PYTHONIOENCODING=utf-8 $V -m unittest discover -s tests        # 155 OK      33.7 s
+#                                                              # 383 OK(skipped=5)  33.4 s
+PYTHONIOENCODING=utf-8 $V -m unittest discover -s tests        # 383 OK      33.2 s
 PYOPENFILEGDB_NO_ACCEL=1 PYTHONIOENCODING=utf-8 $P -m unittest discover -s tests
-#                                                              # 155 OK(skipped=6)
+#                                                              # 383 OK(skipped=6)  74.9 s
 ```
 
-`tests/test_read.py` 需要真实样例库(设 `PYOPENFILEGDB_TEST_GDB`,或放
-`D:/work/*.gdb`);另外两个自给自足。
+⚠️ **做变异测试(或任何"改一行源码看测试红不红")时,前后都要
+`rm -rf pyopenfilegdb/__pycache__`。** 变异前后**字节数相同**时,CPython 的
+`(源文件 mtime, 源文件大小)` 失效判断会失灵,还原源码后旧字节码还在跑 ——
+症状是"源码改回来了,行为却没变",很容易误判成源码里还有第二处 bug。
+
+`tests/test_read.py` 与 `tests/test_coordinates_system.py` 的一部分需要真实样例库
+(设 `PYOPENFILEGDB_TEST_GDB`,或放 `D:/work/*.gdb`);找不到就 skip。其余自给自足。
+`test_coordinates_system.py` 一共 43 个用例,**没装 pyproj 时整组 43 个 skip**,
+其中的 `TestTransformRealCorpus`(5 个)没有样例库时各自 skip —— pyproj 与样例库
+都是可选/外部资源,缺了不等于代码错。
+
+这个新测试文件里有一批用例是**守着具体陷阱**的,不是凑覆盖率:轴序必须 `always_xy`
+(去掉就静默出 `inf`)、量级体检必须报、`origin` 必须严格小于一切坐标(否则写盘直接抛)、
+目标图层 `wkid` 不能是 0、以及**转换不许就地改原几何**。最后一条尤其值得说:它最初
+写成"读一次自己的坐标再比",结果**抓不住变异体** —— 读取本身就把派生视图物化进缓存了。
+改成和独立参照几何比、并且 **point(走 `_coords`)与 polygon(走 `_flat`)两条存储路径
+都覆盖**之后才真的能拦住。这批守卫全部用变异测试确认过会红。
 
 除单元测试外,`tools/` 下有几个**差分闸门**(拿两个实现互相对拍,逐位相同才算过):
 
@@ -311,12 +446,15 @@ PYOPENFILEGDB_NO_ACCEL=1 PYTHONIOENCODING=utf-8 $P -m unittest discover -s tests
 python tools/verify_accel.py     # C 路径 vs 纯 Python:8 个库 11,885 条 / 6,335,486 顶点
 python tools/verify_numpy.py     # numpy 快路径 vs 顺序路径 + 拿 Fraction 当精确解校准
 python tools/verify_wkt_roundtrip.py   # 全语料 WKT 出口体检(往返 + 幂等 + 维度不变)
+python tools/verify_buffer.py    # buffer vs GEOS:1096 对,逐位相同 1015,超差 0
+python tools/verify_overlay.py   # 四个 overlay 算子 vs GEOS:1264 对,全同 1220,超差 0
 python tools/bench_read.py "D:/work/2024年国土行政区划.gdb" 村行政区划   # 复现上面的数字
 ```
 
-**`tools/verify_topology.py`** 拿 GEOS 逐对比 `relate()` 与十个谓词 —— 这是本仓库
-**唯一**允许 `import shapely` / `import osgeo` 的地方,两者都不进包、不进 `tests/`、
-不进 `pyproject.toml`。没装就 skip 并 `exit 0`(那是正常状态,不是失败)。
+**`tools/verify_topology.py`** 拿 GEOS 逐对比 `relate()` 与十个谓词,
+**`tools/verify_buffer.py`** 逐对比 `buffer()`,**`tools/verify_overlay.py`** 逐对比四个
+overlay 算子 —— `import shapely` / `import osgeo` **只出现在 `tools/` 里**,不进包、
+不进 `tests/`、不进 `pyproject.toml`。没装就 skip 并 `exit 0`(那是正常状态,不是失败)。
 
 > 它**真的抓出过两个真 bug**,同一根因:**重算出来的点不能拿去问浮点。**
 > `relate()` 里的探针点有一半是算出来的(交点、中点),它们一般不精确落在对方线段上,
@@ -334,14 +472,29 @@ python tools/bench_read.py "D:/work/2024年国土行政区划.gdb" 村行政区�
 > 重算出来的点恰好逐位精确。**只有跑真参照实现才抓得到。**
 > bug 2 在真实数据上会把两条**完全相同**的行政区面判成"部分重叠"。
 
+> overlay 那一轮又补了一条教训:**判定用的度量本身也可能是错的。**
+> 最初拿"两个结果的对称差的线长"当集合是否相同的主判据,结果 920 对里报了 15 对
+> "集合不同",逐个查下来全是**次 ULP 的伪差**:同一个环把一个顶点的 y 动 **1 ulp**
+> (5.68e-14),两个环的面积差 5.03e-14、**周长差 6.75e-14**,而 GEOS 自己给出的
+> `symmetric_difference` 却是一个**周长 4.75** 的退化环 —— 那是 GEOS 对近重合输入
+> 自身的数值不稳。于是换成三条腿:**对称差面积** + **两个结果各自总长之差** +
+> **Hausdorff 距离**。换完还实测了每条腿各管什么:点被挪 0.4 只有 Hausdorff 抓得住
+> (面积、长度都是恒 0)、线多一根 0.4 的刺由长度差抓、面多出一块 0.16 由面积差抓。
+> 用 GDAL 当真参照时**没有 Hausdorff**(C 层没暴露),被挪开的点会**静默通过** ——
+> 所以那个 oracle 会明说自己少了这条腿,而不是假装验过了。
+
 ---
 
 ## 仓库结构
 
 ```
 pyopenfilegdb/     库本体
-  geometry.py        Geometry —— 度量·描述·构造·DE-9IM 谓词·WKT/GeoJSON
+  geometry.py        Geometry —— 度量·描述·构造·DE-9IM 谓词·buffer·overlay·WKT/GeoJSON
   _geometry_ops.py   纯算法叶子模块(只认 array('d'),不 import 内部模块)
+  _planar.py         平面图:节点化 / 面深度 / 结果环装配(buffer 与 overlay 共用)
+  _buffer_ops.py     缓冲区算法(JTS/GEOS 逐段复刻;算法在 _planar 里)
+  _overlay_ops.py    overlay 四算子(JTS operation/overlayng 逐段复刻)
+  coordinates_system.py  坐标转换(靠 pyproj,可选;也可当命令行脚本跑)
   _gdbtable.py       .gdbtable 读 + 写
   _gdbtablx.py       .gdbtablx 读 + 写
   _esri_geometry.py  Esri 几何 blob ↔ Geometry
@@ -349,18 +502,13 @@ pyopenfilegdb/     库本体
   core.py            OpenFileGDB
   layer.py           GdbLayer
   _gdbaccel.c        可选 C 扩展
-tests/             155 个用例(test_read.py 需样例库,另两个自给自足)
+tests/             383 个用例(test_read.py / test_coordinates_system.py 需样例库)
 examples/          read / create_write 两个可运行示例
 tools/             基准与差分验证脚本(不是库的一部分)
 main.py            最小读示例(性能对照口径的来源)
 ```
 
-库本体 **12,834 行**,测试 **2,812 行**。
-
-> ⚠️ 仓库根目录下还有 `DESIGN.md`(设计说明与逐条踩坑记录,含 GDAL 源码对照)、
-> `STATUS.md`(进度快照)、`ACCEL.md`(C 扩展编译排错)—— 这三份**留在磁盘上但不进
-> 版本库**(它们是本机环境与开发过程的记录,不是产物的一部分)。克隆下来的仓库里
-> 没有它们,`pyproject.toml` 的 description 与本文档是完整信息。
+库本体 **18,935 行**(包内 18,340 行 `.py` + 可选 C 扩展 `_gdbaccel.c` 的 595 行),测试 **5,927 行**。
 
 ---
 

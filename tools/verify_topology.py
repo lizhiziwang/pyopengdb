@@ -122,109 +122,17 @@ UTM_OFFSET = (39393621.0, 3179757.0)
 
 
 # --------------------------------------------------------------------------
-# oracle:把"权威实现"抽象成一个能造几何、能算矩阵、能算谓词的对象
+# oracle:把"权威实现"抽象成一个能造几何、能算矩阵、能算谓词、能算 buffer 的对象
+#
+# ⚠️ 实现搬到了 tools/_oracle.py —— verify_buffer.py 要用同一套。
+#    那条"shapely / osgeo 只允许出现在 tools/ 里"的规矩没变,只是从"这一个
+#    文件"收紧成了"tools/_oracle.py 这一个文件"。
 # --------------------------------------------------------------------------
 
-class ShapelyOracle:
-    """GEOS 本体。`relate` 直接给 DE-9IM 矩阵,10 个谓词全在。
+#: 让 `from _oracle import ...` 在"当脚本跑"和"当模块 import"两种方式下都成立
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-    ⚠️ shapely **不是 GDAL 相关库**(它是 GEOS 的绑定),但仍只在本文件里出现,
-    库、`tests/`、`pyproject.toml` 都不依赖它。
-    """
-
-    name = 'shapely/GEOS'
-    supports_relate = True
-    #: 本库方法名 -> 该 oracle 的函数。**没有的项就是"未暴露"**。
-    unsupported = ()
-    structural_equals = None
-
-    def __init__(self, shapely):
-        self._s = shapely
-
-    def describe(self):
-        s = self._s
-        return (f'shapely {s.__version__} / GEOS '
-                f'{getattr(s, "geos_version_string", "?")}')
-
-    def make(self, wkt):
-        return self._s.from_wkt(wkt)
-
-    def relate(self, a, b):
-        return self._s.relate(a, b)
-
-    def pred(self, name, a, b):
-        return bool(getattr(self._s, name)(a, b))
-
-
-class GdalOracle:
-    """GDAL 的 Python 绑定。比 shapely 弱一档,只作后备。
-
-    ⚠️ 三处与 shapely 不同,必须知道:
-    * **没有 `relate`** —— 比不了矩阵(这正是当年"假绿"的来源);
-    * **没有 `Covers` / `CoveredBy`**;
-    * **`Equals` 是结构比较**,对应本库的 `exactly_equals()`,**不是** `equals()`
-      (实测:`POLYGON((0 0,10 0,10 10,0 10,0 0))` vs 同地多一个共线顶点的版本,
-      GDAL `Equals` 给 False,GEOS `equals` 给 True)。
-    """
-
-    name = 'GDAL/GEOS'
-    supports_relate = False
-    unsupported = ('relate', 'covers', 'covered_by', 'equals')
-    structural_equals = 'exactly_equals'
-
-    #: 本库方法名 -> GDAL 的**方法名**(大小写不同,逐个点出来,不用 .capitalize()
-    #: 猜 —— `covered_by` 猜出来是 `Covered_by`,根本不存在)。
-    _METHOD = {
-        'intersects': 'Intersects',
-        'disjoint': 'Disjoint',
-        'contains': 'Contains',
-        'within': 'Within',
-        'touches': 'Touches',
-        'crosses': 'Crosses',
-        'overlaps': 'Overlaps',
-        'exactly_equals': 'Equals',
-    }
-
-    def __init__(self, ogr):
-        self._ogr = ogr
-
-    def describe(self):
-        try:
-            from osgeo import gdal
-            return f'GDAL {gdal.VersionInfo()}'
-        except Exception:                                   # noqa: BLE001
-            return 'GDAL(版本未知)'
-
-    def make(self, wkt):
-        return self._ogr.CreateGeometryFromWkt(wkt)
-
-    def relate(self, a, b):
-        return None                                          # 未暴露
-
-    def pred(self, name, a, b):
-        m = self._METHOD.get(name)
-        if m is None:
-            return None                                      # 未暴露
-        return bool(getattr(a, m)(b))
-
-
-def pick_oracle(force=None):
-    """挑一个 oracle;装不上就返回 ``None``(调用方负责 skip)。"""
-    if force in (None, 'auto', 'shapely'):
-        try:
-            import shapely
-            return ShapelyOracle(shapely)
-        except ImportError:
-            if force == 'shapely':
-                raise
-    if force in (None, 'auto', 'gdal'):
-        try:
-            from osgeo import ogr
-            return GdalOracle(ogr)
-        except ImportError:
-            if force == 'gdal':
-                raise
-    return None
+from _oracle import GdalOracle, ShapelyOracle, pick_oracle  # noqa: E402,F401
 
 
 # --------------------------------------------------------------------------

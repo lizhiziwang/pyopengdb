@@ -59,6 +59,28 @@ TABLX_HEADER_SIZE = C.TABLX_HEADER_SIZE
 FEATURES_PER_PAGE = C.TABLX_RECORDS_PER_BLOCK
 
 
+def _pack_header(version: int, n_pages: int, count: int, offset_size: int) -> bytes:
+    """16 字节头:version / n1024BlocksPresent / nTotalRecordCount / offset_size。"""
+    return (version.to_bytes(4, 'little')
+            + n_pages.to_bytes(4, 'little')
+            + (count & 0xFFFFFFFF).to_bytes(4, 'little')
+            + offset_size.to_bytes(4, 'little'))
+
+
+def _pack_trailer(n_pages: int) -> bytes:
+    """16 字节 trailer(无位图的布局)。
+
+    ``nBitmapInt32Words = 0`` / ``nLeadingNonZero32BitWords = 0``,
+    中间两个字段都等于页数 —— 与 GDAL ``FileGDBTable::Sync``
+    (``filegdbtable_write.cpp:286-347``)在 ``m_abyTablXBlockMap`` 为空时
+    写出来的内容一致。
+    """
+    return ((0).to_bytes(4, 'little')
+            + n_pages.to_bytes(4, 'little')
+            + n_pages.to_bytes(4, 'little')
+            + (0).to_bytes(4, 'little'))
+
+
 class GdbTablx:
     """一个要素类的 ``.gdbtablx``。
 
@@ -83,6 +105,18 @@ class GdbTablx:
         self._block_map_bits: int = 0
 
         self._dirty = False
+
+        # -- 就地写(对应 GDAL 长开的 ``m_fpTableX``)------------------------
+        # 每写一条要素就把该行的偏移**就地**覆盖掉(见 :meth:`write_offset_in_place`),
+        # 所以需要持有一个可写句柄;只读路径永远不建它。
+        self._fp = None
+        # 磁盘上已经物化了多少页。就地写跨页时只补一页零,不整份重写。
+        self._pages_on_disk = 0
+        # 磁盘上的布局是否"偏移表按行号直接索引"(无位图)。
+        # 有位图的文件**不能**就地写 —— 那时第 row 行的位置是
+        # ``16 + offset_size * (该页之前的已置位页数*1024 + row % 1024)``,
+        # 不是 ``16 + offset_size * row``。这类文件交给整份重写(重写成无位图布局)。
+        self._inplace_ok = False
 
     # ======================================================================
     # 读
@@ -132,6 +166,10 @@ class GdbTablx:
                 )
 
         self._read_offset_table(data)
+        # 无位图的文件才能就地写(位置 = 16 + offset_size*row)。有位图的那种
+        # 一律交给整份重写 —— 重写出来的就是无位图布局。
+        self._inplace_ok = self._block_map is None
+        self._pages_on_disk = self.n_blocks_present if self._inplace_ok else 0
         return self
 
     def _read_trailer(self, data: bytes) -> None:
@@ -252,6 +290,9 @@ class GdbTablx:
         self._offsets = []
         self._block_map = None
         self._dirty = True
+        # 文件还没建;第一次就地写(或 flush)时才建出来
+        self._inplace_ok = True
+        self._pages_on_disk = 0
         return self
 
     def set_offset(self, row: int, offset: int) -> None:
@@ -283,12 +324,93 @@ class GdbTablx:
             self.n_blocks_present = pages_needed
         self._dirty = True
 
+    def write_offset_in_place(self, row: int) -> bool:
+        """把第 ``row`` 行的偏移**就地**写进 ``.gdbtablx``(O(1))。
+
+        对应 GDAL 的两步(每条要素写入时都会被调一次):
+
+        * ``FileGDBTable::SeekIntoTableXForNewFeature``
+          (``filegdbtable_write.cpp:1580``):新行落进还没分配的页时,
+          **只补一页零**(不是整份重写),并把 trailer 标脏;
+        * ``FileGDBTable::WriteFeatureOffset``(:1759):seek 到
+          ``TABLX_HEADER_SIZE + row * offset_size`` 后覆盖 4/5/6 字节。
+
+        这就是 GDAL 逐条写不慢的原因 —— 索引维护是 O(1),整份重写从来不在
+        写入路径上(本库的 :meth:`flush` 是留给 ``sync()`` 的)。
+
+        内存里的 ``_offsets`` 在任何情况下都已经是对的,所以**返回 False 不算失败**
+        (那是"这次没写文件,交给 ``flush`` 一起写"):文件还不存在时由本方法
+        建出一个结构合法的空索引,文件带位图时直接放弃就地写。
+
+        :param row: 0 基行号,必须已在 :meth:`set_offset` 里登记过
+        :return: 是否真的落到了文件上
+        """
+        if not 0 <= row < self.total_record_count:
+            raise GdbWriteError(
+                f'行号 {row} 越界(当前 {self.total_record_count} 条)'
+            )
+        if not self._inplace_ok:
+            return False
+
+        if self._fp is None:
+            if not os.path.exists(self.path):
+                self._create_empty_file()
+            self._fp = open(self.path, 'r+b')
+
+        # ---- 跨页:只补零页(GDAL 的 bWriteEmptyPageAtEnd 那一支)------------
+        page = row // FEATURES_PER_PAGE + 1
+        if page > self._pages_on_disk:
+            n_new = page - self._pages_on_disk
+            page_bytes = self.offset_size * FEATURES_PER_PAGE
+            self._fp.seek(TABLX_HEADER_SIZE + page_bytes * self._pages_on_disk)
+            self._fp.write(b'\x00' * (page_bytes * n_new))
+            # 新页把旧 trailer 覆盖掉了,立刻补一个**合法**的 trailer,并把头部
+            # 的页数(`+4`)同步改掉 —— 这两处必须一起动:本库的读端要求 header
+            # 的 n1024BlocksPresent 与 trailer 的 n1024BlocksBis 一致(不一致直接
+            # 抛 GdbFormatError),只改一边等于让崩掉的文件读不回来。
+            #
+            # 与 GDAL 的差别在这里:GDAL 跨页时只置 `m_bDirtyTableXTrailer = true;
+            # m_nOffsetTableXTrailer = 0`(``filegdbtable_write.cpp:1678-1679``),
+            # trailer 与头部页数**都留到 Sync**。本库选"任何时刻文件结构都成立",
+            # 代价只是页数变化时多写 20 字节(摊到 1024 条上可忽略)。
+            self._pages_on_disk = page
+            self.n_blocks_present = page
+            self._fp.seek(4)
+            self._fp.write(page.to_bytes(4, 'little'))
+            self._fp.seek(TABLX_HEADER_SIZE + page_bytes * page)
+            self._fp.write(_pack_trailer(page))
+
+        self._fp.seek(TABLX_HEADER_SIZE + self.offset_size * row)
+        self._fp.write(self._offsets[row].to_bytes(self.offset_size, 'little'))
+        return True
+
+    def _create_empty_file(self) -> None:
+        """建一个 0 页的空 ``.gdbtablx``(头 16 字节 + trailer 16 字节)。
+
+        对应 GDAL ``FileGDBTable::Create`` 里当场落盘的那部分。
+        """
+        with open(self.path, 'wb') as f:
+            f.write(_pack_header(self.version, 0, 0, self.offset_size))
+            f.write(_pack_trailer(0))
+        self._pages_on_disk = 0
+
+    def close(self) -> None:
+        """关掉就地写用的句柄(不落盘;落盘是 :meth:`flush` 的事)。"""
+        if self._fp is not None:
+            self._fp.close()
+            self._fp = None
+
     def flush(self) -> None:
         """把当前状态写回磁盘。
 
         采用 ArcGIS 最常见的"无位图"简单布局:偏移表按行号直接索引。
         好处是不需要维护 block map 的压实逻辑,代价是删除记录后不会回收
         索引空间 —— 与本项目 Tier2 的目标一致。
+
+        ⚠️ 这个方法**不在写入路径上**(那是 :meth:`write_offset_in_place` 的 O(1)
+        就地写);它只在 ``sync()`` / ``close()`` 时跑一次,对应 GDAL
+        ``FileGDBTable::Sync`` 里的 ``m_bDirtyTableXHeader`` / ``m_bDirtyTableXTrailer``
+        两支。写出来的字节与"逐条就地写"的结果逐位相同(有测试守着)。
         """
         if not self._dirty and os.path.exists(self.path):
             return
@@ -300,11 +422,7 @@ class GdbTablx:
 
         table_bytes = self.offset_size * FEATURES_PER_PAGE * self.n_blocks_present
         buf = bytearray()
-        # --- 头部 ---
-        buf += self.version.to_bytes(4, 'little')
-        buf += self.n_blocks_present.to_bytes(4, 'little')
-        buf += (n & 0xFFFFFFFF).to_bytes(4, 'little')
-        buf += self.offset_size.to_bytes(4, 'little')
+        buf += _pack_header(self.version, self.n_blocks_present, n, self.offset_size)
         # --- 偏移表 ---
         table = bytearray(table_bytes)
         for row in range(n):
@@ -312,16 +430,18 @@ class GdbTablx:
                   self.offset_size * (row + 1)] = \
                 self._offsets[row].to_bytes(self.offset_size, 'little')
         buf += table
-        # --- trailer:无位图 ---
-        buf += (0).to_bytes(4, 'little')                    # nBitmapInt32Words = 0
-        buf += self.n_blocks_present.to_bytes(4, 'little')   # nBitsForBlockMap
-        buf += self.n_blocks_present.to_bytes(4, 'little')   # n1024BlocksBis
-        buf += (0).to_bytes(4, 'little')                    # nLeadingNonZero32BitWords
+        buf += _pack_trailer(self.n_blocks_present)
 
+        # 重写要换掉整个文件(临时文件 + os.replace),所以就地写的句柄必须先关 ——
+        # ⚠️ Windows 上 os.replace 不能覆盖还开着句柄的文件(实测 WinError 5)。
+        self.close()
         tmp = self.path + '.tmp'
         with open(tmp, 'wb') as f:
             f.write(bytes(buf))
         os.replace(tmp, self.path)
+        # 换完之后磁盘上就是"无位图 + 整份"的布局,就地写可以接着用
+        self._inplace_ok = True
+        self._pages_on_disk = self.n_blocks_present
         self._dirty = False
 
     # ======================================================================

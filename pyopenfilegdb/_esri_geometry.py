@@ -812,7 +812,7 @@ def to_wkt(geom: Optional[Geometry]) -> str:
 
     ``from_wkt`` 本来就把 ``MULTIPOLYGON`` 摊成 parts,所以**往返仍然成立**。
     """
-    if geom is None or geom.is_empty:
+    if geom is None:
         return 'GEOMETRYCOLLECTION EMPTY'
 
     kind = geom.kind
@@ -821,6 +821,48 @@ def to_wkt(geom: Optional[Geometry]) -> str:
             'multipatch 不能导出成 WKT:FileGDB 存的是 triangle strip / '
             'triangle fan 的片段流,而 WKT 没有对应的几何类型,硬凑要自己编'
             '一套约定。见 DESIGN.md §2.21。')
+
+    if kind == 'geometrycollection':
+        kids = geom.geometries()
+        if not kids:
+            return 'GEOMETRYCOLLECTION EMPTY'
+        # ⚠️ **外层不写 ``Z`` / ``M`` 后缀。** WKT1 的 ``GEOMETRYCOLLECTION Z
+        # (...)`` 表示"里面**每个**子几何都是 Z",而本库的 GC 允许混合维度
+        # (``POLYGON ∪ 面外的 POINT`` 出来的就是 2D + 2D)。写上去的话,
+        # ``from_wkt`` 会把一个 2D 子几何按 Z 读回来、Z 分量填 NaN —— 一次
+        # 往返就把几何改坏了。**每个子几何自己写自己的后缀**,读侧各自的
+        # 后缀优先,于是混合维度也能原样往返。
+        # (GDAL 的 ``exportToWkt`` 在 GC 上是写外层后缀的,这是本库与它的一处
+        # 刻意分岔 —— 本库选择"能往返"而不是"与 GDAL 的字符串一致"。)
+        return ('GEOMETRYCOLLECTION ('
+                + ', '.join(to_wkt(k) for k in kids) + ')')
+
+    # ⚠️ **维度后缀必须写出来。** 只把第三个分量打出来是不够的:
+    # ``LINESTRING (0 0 7, 1 1 8)`` 在 WKT1 里被理解成 **Z**,而这个几何是
+    # **M** —— 本库自己的 ``from_wkt`` 读回来就会变成 Z,GDAL / PostGIS 同此,
+    # 于是带 M 的几何往返一次维度就变了。GDAL 导出时是带后缀的
+    # (``OGRGeometry::exportToWkt`` 里的 ``WktType`` 拼装),这里跟它一致。
+    if geom.has_z and geom.has_m:
+        tag = ' ZM'
+    elif geom.has_z:
+        tag = ' Z'
+    elif geom.has_m:
+        tag = ' M'
+    else:
+        tag = ''
+
+    # 空几何按**自己的类型**渲染。
+    # ⚠️ 这里曾经是一句无条件的 ``return 'GEOMETRYCOLLECTION EMPTY'``,把下面
+    #    那些按 kind 分的分支全变成了死代码。后果实打实:overlay 的空结果本来
+    #    就该是 ``POLYGON EMPTY`` / ``LINESTRING EMPTY`` / ``POINT EMPTY``
+    #    (``_overlay_ops._empty_result`` 造的就是这三种 kind),导出来却一律成了
+    #    ``GEOMETRYCOLLECTION EMPTY`` —— 类型变了,喂给 GEOS 一比就是"成员表空"
+    #    对一个空成员。``null``(``ST.NULL`` 那种真的没有类型的空几何)才回
+    #    ``GEOMETRYCOLLECTION EMPTY``,那是原来就对的用法。
+    if geom.is_empty:
+        return ({'point': 'POINT', 'multipoint': 'MULTIPOINT',
+                 'polyline': 'LINESTRING', 'polygon': 'POLYGON'}
+                .get(kind, 'GEOMETRYCOLLECTION') + tag + ' EMPTY')
 
     parts = geom.xy_parts
     zs = geom.z_parts
@@ -844,20 +886,6 @@ def to_wkt(geom: Optional[Geometry]) -> str:
             # OGC WKT 要求环闭合;内存里的环不存闭合点
             body += ', ' + _pt_wkt_bare(a, 0, z_at(i), m_at(i))
         return '(' + body + ')'
-
-    # ⚠️ **维度后缀必须写出来。** 只把第三个分量打出来是不够的:
-    # ``LINESTRING (0 0 7, 1 1 8)`` 在 WKT1 里被理解成 **Z**,而这个几何是
-    # **M** —— 本库自己的 ``from_wkt`` 读回来就会变成 Z,GDAL / PostGIS 同此,
-    # 于是带 M 的几何往返一次维度就变了。GDAL 导出时是带后缀的
-    # (``OGRGeometry::exportToWkt`` 里的 ``WktType`` 拼装),这里跟它一致。
-    if geom.has_z and geom.has_m:
-        tag = ' ZM'
-    elif geom.has_z:
-        tag = ' Z'
-    elif geom.has_m:
-        tag = ' M'
-    else:
-        tag = ''
 
     if kind == 'point':
         if not parts or not parts[0]:
@@ -966,6 +994,12 @@ def to_geo_dict(geom: Optional[Geometry]) -> Dict[str, Any]:
             'multipatch 不能导出成 GeoJSON:FileGDB 存的是 triangle strip / '
             'triangle fan 的片段流,与 GeoJSON 的几何模型对不上。'
             '见 DESIGN.md §2.21。')
+
+    if kind == 'geometrycollection':
+        # GeoJSON **本来就有** GeometryCollection(而且是唯一能装混合维度
+        # 的类型),所以这一档不需要任何约定,直接递归。
+        return {'type': 'GeometryCollection',
+                'geometries': [to_geo_dict(k) for k in geom.geometries()]}
 
     parts = geom.xy_parts
     zs = geom.z_parts            # M 不在这里 —— 导出时按约定丢弃
@@ -1179,9 +1213,13 @@ def from_geojson(data: Any, has_m: bool = False) -> Geometry:
 
     if type_name == 'GeometryCollection':
         geometries = obj.get('geometries') or []
-        if geometries:
-            raise GdbFormatError('非空的 GeometryCollection 装不进一个 Geometry')
-        return Geometry()
+        if not geometries:
+            return Geometry()
+        # GeoJSON 本来就有 GeometryCollection,递归解析即可 —— 里面是什么维度
+        # 都行(这正是 GC 存在的理由)。⚠️ 空的 GC 仍然解析成空几何(NULL 类型),
+        # 与 WKT 那边同口径:全库的"空几何"只有一个表示。
+        return Geometry.geometry_collection(
+            [from_geojson(g, has_m=has_m) for g in geometries])
 
     base = _GEOJSON_TYPES.get(type_name)
     if base is None:
@@ -1408,15 +1446,61 @@ def _strip_ring_closure(points: List[Tuple[float, ...]], where: str
     return points
 
 
+def _split_wkt_children(body: str) -> List[str]:
+    """把 ``GEOMETRYCOLLECTION ( ... )`` 的**括号里面**按顶层逗号切开。
+
+    ``body`` 是**不含**最外层那对括号的内容。返回每个子几何的 WKT 文本
+    (已经 strip),交给 :func:`from_wkt` 递归。
+
+    ⚠️ 必须按**括号深度**切,不能直接 ``body.split(',')`` —— 子几何自己就带
+    逗号(``POINT (1 2)`` 没有,但 ``POLYGON ((0 0, 1 0, 1 1, 0 0))`` 有一堆)。
+
+    ⚠️ 这里**不做浮点数的格式化往返**:切出来的是原始文本片段,原样丢给递归的
+    ``from_wkt``。要是先解析成 ``float`` 再拼回字符串,末位就变了。
+    """
+    out: List[str] = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(body):
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth < 0:
+                raise GdbWriteError(f'GEOMETRYCOLLECTION 的括号不平衡: {body!r}')
+        elif ch == ',' and depth == 0:
+            out.append(body[start:i])
+            start = i + 1
+    if depth != 0:
+        raise GdbWriteError(f'GEOMETRYCOLLECTION 的括号不平衡: {body!r}')
+    out.append(body[start:])
+    kids = [chunk.strip() for chunk in out]
+    if not kids or not kids[0]:
+        raise GdbWriteError('GEOMETRYCOLLECTION 里没有子几何')
+    for index, kid in enumerate(kids):
+        if not kid:
+            raise GdbWriteError(
+                f'GEOMETRYCOLLECTION 第 {index + 1} 个子几何是空的(多了个逗号?)')
+    return kids
+
+
 def from_wkt(wkt: str, has_z: bool = False, has_m: bool = False) -> Geometry:
     """OGC WKT -> :class:`Geometry`。
 
     支持 ``POINT`` / ``MULTIPOINT`` / ``LINESTRING`` / ``MULTILINESTRING`` /
-    ``POLYGON`` / ``MULTIPOLYGON``,可选 ``Z`` / ``M`` / ``ZM`` 后缀,以及
-    ``EMPTY``(返回空几何)。可选的前导 ``SRID=n;`` 会被忽略。
+    ``POLYGON`` / ``MULTIPOLYGON`` / ``GEOMETRYCOLLECTION``(可嵌套),可选
+    ``Z`` / ``M`` / ``ZM`` 后缀,以及 ``EMPTY``(返回空几何)。可选的前导
+    ``SRID=n;`` 会被忽略。
 
     :param has_z: 坐标里没有 Z 分量时是否按带 Z 处理(会被 WKT 后缀覆盖)。
     :param has_m: 同上,针对 M。
+
+    ⚠️ ``GEOMETRYCOLLECTION`` 是**纯内存类型** —— FileGDB 的 ``ShapeType``
+    里没有这一档,解析出来的 GC **写不进 .gdb**(``encode_geometry`` 会报错)。
+    另外 ``GEOMETRYCOLLECTION Z (...)`` 这种**外层**后缀本库不收(会把 2D
+    子几何读成 Z 值全 NaN),理由见那个分支的注释。``GEOMETRYCOLLECTION EMPTY``
+    按全库惯例解析成空几何(NULL 类型),不是空 GC —— 与 ``POLYGON EMPTY``
+    一样,空几何的 WKT 本来就往返不回来。
 
     .. note:: ``MULTIPOLYGON`` 是 **有损** 的。Esri 的几何 blob 里没有"多个
        面"这个类型,所有环摊在同一个 POLYGON 的 parts 里;而 parts 的方向
@@ -1454,6 +1538,30 @@ def from_wkt(wkt: str, has_z: bool = False, has_m: bool = False) -> Geometry:
                                has_z=has_z, has_m=has_m)
         else:
             raise GdbWriteError(f'WKT 类型名后面出现无法识别的词 {word!r}')
+
+    if type_name == 'GEOMETRYCOLLECTION':
+        # ⚠️ 递归分支,在 ``_WKT_TYPES`` 那层之前 —— 因为它不对应任何 Esri
+        # 基础 shape type(FileGDB 的 ShapeType 里没有这一档),塞进那张表就
+        # 会让人以为它编码得出来。见 ``_constants.ShapeType.GEOMETRYCOLLECTION``。
+        if suffix:
+            # ``GEOMETRYCOLLECTION Z (...)`` 是合法 WKT,但语义是"每个子几何
+            # 都是 Z"。本库允许混合维度的 GC,把外层后缀硬套下去会把 2D 子几何
+            # 改成"Z 值全 NaN",所以干脆不收 —— 让调用方给每个子几何写清后缀。
+            raise GdbWriteError(
+                'GEOMETRYCOLLECTION 不支持外层 Z / M 后缀:那表示"每个子几何'
+                '都是 Z",而本库的 GEOMETRYCOLLECTION 允许混合维度,硬套会把'
+                '2D 子几何改成 Z 值全 NaN。请给每个子几何单独写后缀,'
+                '例如 GEOMETRYCOLLECTION (POINT Z (1 2 3), POLYGON ((...)))。')
+        open_paren = text.find('(')
+        if open_paren < 0:
+            raise GdbWriteError(f'GEOMETRYCOLLECTION 里没有子几何: {wkt!r}')
+        body = text[open_paren + 1:]
+        if not body.rstrip().endswith(')'):
+            raise GdbWriteError(f'GEOMETRYCOLLECTION 的括号不平衡: {wkt!r}')
+        body = body.rstrip()[:-1]
+        return Geometry.geometry_collection(
+            [from_wkt(chunk, has_z=has_z, has_m=has_m)
+             for chunk in _split_wkt_children(body)])
 
     if type_name not in _WKT_TYPES:
         raise GdbWriteError(
@@ -1725,6 +1833,17 @@ def encode_geometry(geom: Optional[Geometry], geom_field: Any = None,
         return bytes(out)
 
     kind = geom.kind
+
+    if kind == 'geometrycollection':
+        # 放在 ``is_empty`` 早退**之后**:一个"子几何全空"的 GC 与其它空几何
+        # 一样写 NULL —— 那是同一个含义,没必要报错。非空的 GC 则明确拒绝:
+        # 悄悄丢一个 NULL 出去等于把整个几何吃掉。
+        raise GdbWriteError(
+            'GEOMETRYCOLLECTION 写不进 FileGDB:Esri 的 ShapeType 里**没有**'
+            '这一档(见 _constants.ShapeType.GEOMETRYCOLLECTION),'
+            '盘上根本没有能表达"一个面加一个点"的记录。它只是内存里的运算'
+            '结果(overlay 出来的),要落盘请先把子几何拆开、每个写一条要素,'
+            '或者只写其中一维。')
 
     if kind == 'point':
         return _encode_point(out, q, geom.coordinates, has_z, has_m)

@@ -214,6 +214,10 @@ class GdbTable:
         # ---- 写路径状态 ----
         # 以 'r+b' 打开的文件句柄;None 表示当前是只读的
         self._fp = None
+        # 有"还没落到底盘账目里"的改动(表头计数 / 文件大小 / 索引),sync() 才写。
+        # 对应 GDAL 的 m_bDirtyHeader + m_bDirtyTableXHeader + m_bDirtyTableXTrailer:
+        # 逐条写只写记录体与那一行的索引,头部一律攒到这里。
+        self._dirty = False
         # 几何字段的全表包围盒被改过,需要在 sync() 时回填字段描述区
         self._dirty_geom_bbox = False
         # 全表包围盒 [xmin, ymin, xmax, ymax];None = 还没有任何几何
@@ -1148,6 +1152,9 @@ class GdbTable:
             os.path.join(self.dir, self.basename + '.gdbtablx'),
             offset_size=offset_size)
         self._write_header()
+        # 还欠一个 .gdbtablx 文件(它是第一次 sync()/flush() 才建出来的),
+        # 所以这里就标脏,免得"建完就 close、一条要素都没写"的表少了索引文件。
+        self._dirty = True
         return self
 
     # ----------------------------------------------------------------------
@@ -1164,6 +1171,17 @@ class GdbTable:
                 f'{os.path.basename(path)}: 版本 {self.version} 不支持写入'
             )
         self._fp = open(path, 'r+b')
+        # ⚠️ 文件大小**量文件**,不读表头 —— 对应 GDAL `FileGDBTable::OpenFile`
+        # 在 `m_bUpdate` 下那两句(`filegdbtable.cpp:982-986`):
+        #     VSIFSeekL(m_fpTable, 0, SEEK_END);
+        #     m_nFileSize = VSIFTellL(m_fpTable);
+        # 头部是可以懒写的(写要素不再逐条 sync),所以表头里的 +24 完全可能
+        # 落后于真实长度;信它就会把一个新记录覆盖到**已有记录上面**。
+        # 表头里的 +24 只在 sync() 时更新,读方向不依赖它。
+        try:
+            self.file_size = os.path.getsize(path)
+        except OSError:
+            pass
         # 把已有的全表包围盒接过来,避免追加要素时把老范围丢掉
         gf = self.geom_field
         if gf is not None and not any(
@@ -1307,7 +1325,10 @@ class GdbTable:
         out.buf += blob
 
         # 顺带维护几何字段的全表包围盒(见 GDAL 的
-        # m_bDirtyGeomFieldBBox;这里在 sync() 时统一落盘)
+        # m_bDirtyGeomFieldBBox)。内存里立刻就更新 ``geom_field`` 上的值 ——
+        # GDAL 也是这样(包围盒对象当场改,只有**落盘**推迟到 Sync),
+        # 所以 ``layer.extent`` 写完一条马上就是新范围;
+        # 字段描述区里的那 4 个 double 仍然留到 sync()。
         if geom is not None and not geom.is_empty:
             try:
                 xs, ys = _geom_xy(geom)
@@ -1323,6 +1344,10 @@ class GdbTable:
                 b[1] = min(b[1], min(ys))
                 b[2] = max(b[2], max(xs))
                 b[3] = max(b[3], max(ys))
+            if self.geom_field is not None:
+                b = self._bbox
+                self.geom_field.xmin, self.geom_field.ymin = b[0], b[1]
+                self.geom_field.xmax, self.geom_field.ymax = b[2], b[3]
             self._dirty_geom_bbox = True
 
     # ----------------------------------------------------------------------
@@ -1366,6 +1391,11 @@ class GdbTable:
         对应 GDAL ``FileGDBTable::CreateFeature``。OID 不进记录体,而是由
         ``.gdbtablx`` 的槽位下标(``OID - 1``)隐式承载,所以写入顺序即
         OID 顺序。
+
+        ⚠️ 这里 **不落盘头部**:记录体当场写,索引只就地把这一行覆盖掉
+        (``write_offset_in_place``,对应 GDAL ``WriteFeatureOffset``),
+        计数/文件大小/索引头由 :meth:`sync` 统一写 —— 与 GDAL 的脏标记
+        口径一致。所以``layer.sync()`` / ``close()`` 才是落盘点。
         """
         if self._fp is None or self.tablx is None:
             raise GdbWriteError('表不是以可写方式打开的')
@@ -1382,7 +1412,9 @@ class GdbTable:
 
         oid = self.tablx.record_count + 1
         self.tablx.set_offset(oid - 1, offset)
+        self.tablx.write_offset_in_place(oid - 1)
         self.valid_record_count += 1
+        self._dirty = True
         return oid
 
     # ----------------------------------------------------------------------
@@ -1391,6 +1423,9 @@ class GdbTable:
 
         对应 GDAL ``UpdateFeature``:新记录体 **不大于** 旧的时候原地重写并用
         0 填满尾部;变大了才追加到文件末尾、把旧槽标记为已删除。
+
+        只有"追加到末尾"那一支会动索引,索引改动同样就地写(其余与
+        :meth:`append_feature` 一样,头部攒到 :meth:`sync`)。
         """
         if self._fp is None or self.tablx is None:
             raise GdbWriteError('表不是以可写方式打开的')
@@ -1406,6 +1441,7 @@ class GdbTable:
             raise GdbWriteError(f'OID {feature.oid} 已被删除')
 
         blob = self.encode_feature(feature)
+        self._dirty = True
 
         if len(blob) <= old_len:
             self._fp.seek(offset)
@@ -1428,6 +1464,7 @@ class GdbTable:
         self._fp.write(negated.to_bytes(4, 'little'))
 
         self.tablx.set_offset(row, new_offset)
+        self.tablx.write_offset_in_place(row)
         if len(blob) > self.header_buffer_max_size:
             self.header_buffer_max_size = len(blob)
 
@@ -1438,6 +1475,9 @@ class GdbTable:
         对应 GDAL ``DeleteFeature``:``.gdbtablx`` 槽位写 0,``.gdbtable`` 里
         的长度字 **取负**。二者合起来让任何读取方都能把该槽判为空。
         索引空间不回收(不维护 ``.freelist``,见 :mod:`._gdbindex` 的说明)。
+
+        ``.gdbtablx`` 里的 0 是**就地**写进去的(对应 GDAL ``DeleteFeature``
+        里那句 ``WriteFeatureOffset(0)``),计数留给 :meth:`sync`。
         """
         if self._fp is None or self.tablx is None:
             raise GdbWriteError('表不是以可写方式打开的')
@@ -1454,15 +1494,29 @@ class GdbTable:
         self._fp.seek(offset)
         self._fp.write(((-old_len) & 0xFFFFFFFF).to_bytes(4, 'little'))
         self.tablx.set_offset(row, 0)
+        self.tablx.write_offset_in_place(row)
         self.valid_record_count -= 1
+        self._dirty = True
 
     # ----------------------------------------------------------------------
     def sync(self) -> None:
         """把头部、几何包围盒与 ``.gdbtablx`` 刷到磁盘。
 
-        对应 GDAL ``FileGDBTable::Sync``。
+        对应 GDAL ``FileGDBTable::Sync``:字段描述区的包围盒
+        (``m_bDirtyGeomFieldBBox``)、主头计数与文件大小(``m_bDirtyHeader``)、
+        索引头与 trailer(``m_bDirtyTableXHeader`` / ``m_bDirtyTableXTrailer``)
+        都在这里一次写完;结尾也只是 ``VSIFFlushL``,**没有 fsync**。
+
+        逐条写要素**不会**调它(见 :meth:`append_feature`),所以它是攒批之后
+        的落盘点 —— GDAL 那边由 ``SyncToDisk()`` / ``FlushCache()`` /
+        事务边界调,本库由 :meth:`GdbLayer.sync` / ``close()`` / ``gdb.close()``
+        以及"读之前"(`GdbLayer._flush_pending`)调。
+
+        没有挂起改动时**空转**(幂等,反复调不花代价)。
         """
         if self._fp is None:
+            return
+        if not self._dirty and not self._dirty_geom_bbox:
             return
         if self._dirty_geom_bbox and self.geom_field is not None:
             self._write_geom_bbox()
@@ -1474,6 +1528,7 @@ class GdbTable:
         # (见 GDAL 的 GetAndSelectNextNonEmptyRow 循环),Python 层的写缓冲
         # 不落盘的话它会读到旧内容。
         self._fp.flush()
+        self._dirty = False
 
     # ----------------------------------------------------------------------
     def _write_geom_bbox(self) -> None:
@@ -1527,6 +1582,8 @@ class GdbTable:
         try:
             self.sync()
         finally:
+            if self.tablx is not None:
+                self.tablx.close()
             if self._fp is not None:
                 self._fp.close()
                 self._fp = None

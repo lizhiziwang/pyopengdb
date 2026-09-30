@@ -243,6 +243,20 @@ class ShapeType:
     MULTIPATCH = 32
     MULTIPATCHM = 31
 
+    #: ``GEOMETRYCOLLECTION`` —— ⚠️ **这不是 Esri 的值。**
+    #:
+    #: FileGDB 的 ``ShapeType`` 里**没有** GEOMETRYCOLLECTION 这一档,所以它是
+    #: 一个**纯内存类型**:只作为 overlay 的结果出现(``POLYGON ∪ 面外的 POINT``),
+    #: **永远写不进 .gdb** —— :func:`~pyopenfilegdb._esri_geometry.encode_geometry`
+    #: 会明确报错,不是悄悄丢一个 NULL 出去。
+    #:
+    #: 取 ``-1`` 是刻意的:上面这一套编号的取值范围是 ``0``–``54``,GDAL 的
+    #: ``OGRwkbGeometryType`` 又是 ``1``–``7`` 那一套,``-1`` 落在**两个编号
+    #: 空间之外**,任何"按编号查表"的老代码都不会把它误认成某个真类型。
+    #: (GDAL 自己在 WKB 里用 ``wkbGeometryCollection = 7``,但那是另一套编号,
+    #: 拿来塞进这个类只会让人以为它能编码。)
+    GEOMETRYCOLLECTION = -1
+
     # "GENERAL" 系列:FileGDB 里表示"混合/任意"的同类几何
     GENERALPOLYLINE = 50
     GENERALPOLYGON = 51
@@ -294,7 +308,14 @@ class ShapeType:
 
     @classmethod
     def base_kind(cls, t: int) -> str:
-        """归一化到 point / polyline / polygon / multipoint / multipatch / null。"""
+        """归一化到 point / polyline / polygon / multipoint / multipatch /
+        geometrycollection / null。
+
+        ⚠️ ``geometrycollection`` **不是** Esri 的类型(见常量定义处的说明)——
+        它只可能来自内存里构造出来的几何,盘上读不出来。
+        """
+        if t == cls.GEOMETRYCOLLECTION:
+            return 'geometrycollection'
         if t in cls._POINT_ALL:
             return 'point'
         if t in cls._POLYLINE_ALL:

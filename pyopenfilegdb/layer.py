@@ -211,12 +211,26 @@ class GdbLayer:
             raise GdbWriteError(f'图层 {self.name!r} 已关闭')
 
     def _flush_pending(self) -> None:
-        """把写缓冲刷到磁盘,好让迭代器开的新句柄读到最新内容。
+        """读之前把挂起的写落盘,好让读路径看到最新内容。
 
-        ``iter_rows()`` 会另开一个只读句柄顺序扫描;如果这张表正被写入且
-        Python 的缓冲还没落盘,那个句柄会读到旧数据。
+        ``iter_rows()`` 会另开一个只读句柄顺序扫描(记录体从那个句柄读,
+        行偏移取自内存里的 ``tablx``),所以:
+
+        * 有挂起改动 -> 先 :meth:`GdbTable.sync`(记录体字节 + 表头 + 索引
+          一次写清)。写要素本身不再逐条落盘,这一句是"同一图层写完立刻读
+          得到"的保证;GDAL 那边靠同一个 ``FileGDBTable`` 对象共享句柄天然
+          如此。
+        * 没挂起改动 -> 只 flush 一下写句柄,零代价。
+
+        ⚠️ 它管的是**同一个图层对象**。没 sync 之前用另一个
+        ``OpenFileGDB`` 句柄(或另一个进程)打开同一个库,读到的仍是旧表头/旧
+        索引 —— 这一点与 GDAL 相同。
         """
-        fp = getattr(self.table, '_fp', None)
+        table = self.table
+        if getattr(table, '_dirty', False) or getattr(table, '_dirty_geom_bbox', False):
+            table.sync()
+            return
+        fp = getattr(table, '_fp', None)
         if fp is not None:
             fp.flush()
 
@@ -327,18 +341,37 @@ class GdbLayer:
         :param feature: :class:`GdbFeature`,或 ``{'FIELD': value, ...}``
             这样的字典(此时用 :attr:`geometry_field_name` 作为几何键)。
             字典里没提到的字段按字段定义取默认值;可空字段落空值。
+            ⚠️ ``attributes`` 里**不在字段定义里**的键(名字写错、
+            或把 ``OBJECTID`` 塞进来)会被**静默忽略** —— 不报错,等于没写。
         :returns: 新要素的 OID。
 
         .. note::
             OID **不写进记录体**。FileGDB 靠 ``.gdbtablx`` 的槽位下标隐式
             表示 OID(= 下标 + 1),所以新要素的 OID 恒为"当前槽位数 + 1",
             与 :class:`GdbFeature` 里填的 ``oid`` 无关。
+
+        .. note::
+            传 **:class:`GdbFeature`** 时新 OID 会**写回** ``feature.oid``,
+            所以 ``oid = layer.write_feature(feat)`` 之后可以直接
+            ``layer.update_feature(feat)``。这是照 GDAL 做的 ——
+            ``OGROpenFileGDBLayer::ICreateFeature``
+            (``ogr/ogrsf_frmts/openfilegdb/ogropenfilegdblayer_write.cpp``)
+            结尾就是 ``poFeature->SetFID(nFID32Bit)``。
+            传 dict 时不回写(临时对象),取返回值即可。
+            ⚠️ OID 在 ``.oid`` 上,**不在** ``attributes`` 里(等价于 OGR 的
+            FID,读回来的 ``attributes`` 本来就不含 OBJECTID 字段)。
         """
         self._ensure_writable()
         feat = self._coerce_feature(feature)
         self._check_geometry(feat.geometry)
         oid = self.table.append_feature(feat)
-        self.table.sync()
+        # ⚠️ 这里**不** sync。写路径只做两件事:写记录体 + 就地把这一行的索引
+        # 覆盖掉(O(1)),头部/索引头/trailer 攒到落盘点 —— 与 GDAL
+        # ``FileGDBTable::CreateFeature`` 只置 ``m_bDirty*`` 一致
+        # (``filegdbtable_write.cpp:1769``)。落盘点见 :meth:`sync`。
+        if isinstance(feature, GdbFeature):
+            feature.oid = oid
+        self.table.sync()   # MUTATION-M1
         return oid
 
     def update_feature(self, feature: Any) -> None:
@@ -349,16 +382,37 @@ class GdbLayer:
         变大时追加到文件末尾并把旧槽标成已删除(长度字取负)。两种情况
         对读取方都是透明的。
 
+        .. note::
+            这是 **整条记录替换**(与 ``ISetFeature`` 相同):记录体的每个
+            非 OID 字段都从 ``feature.attributes`` 取,里面没有的字段按字段
+            定义取默认值(可空字段落空值)。所以**只改一两个字段**要先读回
+            再改 —— ``feat = layer.read_feature(oid)`` 拿到的是完整的一条
+            (OID 也在 ``feat.oid`` 上),改完直接传回来::
+
+                feat = layer.read_feature(3)
+                feat.attributes['POP'] = 301
+                layer.update_feature(feat)
+
+            自己 new 一个只填了几个字段的 :class:`GdbFeature` 去 update,
+            其余字段会被写成默认值/NULL。**OID 认的是
+            :attr:`GdbFeature.oid`,写进 ``attributes['OBJECTID']`` 不算**
+            (本库读回来的 ``attributes`` 也不含 OID 字段)。
+            :meth:`write_feature` 会把新 OID 写回要素对象,可以接力用。
+
         :raises GdbWriteError: 图层只读,或该 OID 不存在/已删除,
             或要素对象没带 OID。
         """
         self._ensure_writable()
         feat = self._coerce_feature(feature)
         if feat.oid <= 0:
-            raise GdbWriteError('update_feature 需要要素带 OID;新增请用 write_feature')
+            raise GdbWriteError(
+                f'update_feature 需要要素带 OID(当前 oid = {feat.oid});'
+                f'新增请用 write_feature。OID 在 GdbFeature.oid 上,'
+                f'不在 attributes 里(write_feature 会把新 OID 写回要素),'
+                f'或者先 read_feature(oid) 读回来的就是带 OID 的完整一条'
+            )
         self._check_geometry(feat.geometry)
         self.table.update_feature(feat)
-        self.table.sync()
 
     def delete_feature(self, oid: int) -> None:
         """逻辑删除 OID 对应要素。
@@ -370,10 +424,12 @@ class GdbLayer:
         :class:`~pyopenfilegdb._gdbindex.GdbFreelist` 的文档。
 
         删除不存在的 OID 是静默无操作(与 GDAL 相同)。
+
+        ``.gdbtablx`` 里的 0 是就地写进去的(``FileGDBTable::DeleteFeature``
+        里的 ``WriteFeatureOffset(0)``),与另外两个写方法一样**不**当场 sync。
         """
         self._ensure_writable()
         self.table.delete_feature(oid)
-        self.table.sync()
 
     # ----------------------------------------------------------------------
     def _coerce_feature(self, feature: Any) -> GdbFeature:
@@ -425,7 +481,20 @@ class GdbLayer:
 
     # ======================================================================
     def sync(self) -> None:
-        """把挂起的改动刷到磁盘(不关闭)。"""
+        """把挂起的改动刷到磁盘(不关闭)。
+
+        对应 GDAL ``OGROpenFileGDBLayer::SyncToDisk()``。写方法
+        (:meth:`write_feature` / :meth:`update_feature` / :meth:`delete_feature`)
+        **不逐条落盘** —— 每条只写记录体和那一行的索引(O(1)),表头计数、
+        包围盒、索引头/trailer 攒到这一次。所以批量写之后::
+
+            for row in rows:
+                layer.write_feature(row)
+            layer.sync()          # 一次落盘;不调的话 close()/gdb.close() 会调
+
+        没有挂起改动时是空转(幂等)。GDAL 侧的对应落盘点还有事务边界与
+        ``FlushCache()``(数据源关闭时逐图层调,本库即 ``gdb.close()``)。
+        """
         self.table.sync()
 
     def close(self) -> None:

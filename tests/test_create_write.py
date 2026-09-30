@@ -534,8 +534,65 @@ class TestCreateLayerAndWrite(_TempGdbCase):
 
     def test_update_without_oid_is_refused(self):
         layer = self.gdb.create_layer('U', geometry_type=None)
-        with self.assertRaises(GdbWriteError):
+        with self.assertRaises(GdbWriteError) as ctx:
             layer.update_feature({'A': 1})
+        # 报错要把"OID 在 .oid 上、不在 attributes 里"说出来 —— 这是最容易
+        # 踩的一种:写完 write_feature 顺手 attributes['OBJECTID'] = oid。
+        msg = str(ctx.exception)
+        self.assertIn('.oid', msg)
+        self.assertIn('attributes', msg)
+
+    def test_write_feature_writes_oid_back_on_feature(self):
+        """write_feature 把新 OID 写回传进去的 GdbFeature,可接力 update。
+
+        照 GDAL ``OGROpenFileGDBLayer::ICreateFeature`` 结尾的
+        ``poFeature->SetFID(nFID32Bit)``
+        (``ogr/ogrsf_frmts/openfilegdb/ogropenfilegdblayer_write.cpp``)。
+        传给它的 dict 是临时对象,不回写 —— 那条路取返回值。
+        """
+        layer = self.gdb.create_layer(
+            'W', geometry_type='point', fields=[GdbField('V', FGFT_INT32)])
+        feat = GdbFeature(attributes={'V': 1},
+                          geometry=Geometry.from_wkt('POINT (1 1)'))
+        self.assertEqual(feat.oid, 0)
+        self.assertEqual(layer.write_feature(feat), 1)
+        self.assertEqual(feat.oid, 1)              # 写回
+
+        # 不用手动赋 OID 就能直接改
+        feat.attributes['V'] = 7
+        layer.update_feature(feat)
+        self.assertEqual(layer.read_feature(1)['V'], 7)
+
+        feat2 = GdbFeature(attributes={'V': 2})
+        self.assertEqual(layer.write_feature(feat2), 2)
+        self.assertEqual(feat2.oid, 2)
+
+        d = {'V': 3}
+        self.assertEqual(layer.write_feature(d), 3)
+        self.assertNotIn('oid', d)                 # dict 不回写
+
+    def test_oid_in_attributes_does_not_count(self):
+        """attributes 里的 OBJECTID / OID 不算 OID(静默忽略)。
+
+        本库读回来的 ``attributes`` 就不含 OID 字段(它等价于 OGR 的 FID),
+        写回去时也不认它 —— 所以 ``feat.attributes['OBJECTID'] = 3`` 之后再
+        update_feature 仍应报"没带 OID",而不是去改第 3 条。
+        """
+        layer = self.gdb.create_layer('U', geometry_type=None,
+                                      fields=[GdbField('V', FGFT_INT32)])
+        layer.write_feature({'V': 10})
+        layer.write_feature({'V': 20})
+
+        feat = GdbFeature(attributes={'V': 99})
+        feat.attributes['OBJECTID'] = 2            # 无效写法
+        with self.assertRaises(GdbWriteError):
+            layer.update_feature(feat)
+        # 两条都没被动过
+        self.assertEqual([f['V'] for f in layer.read_features()], [10, 20])
+
+        # dict 那条路上 OBJECTID 键倒是"认"的(与 .oid 同义),这里顺带钉住
+        layer.update_feature({'V': 21, 'OBJECTID': 2})
+        self.assertEqual([f['V'] for f in layer.read_features()], [10, 21])
 
     def test_updates_survive_reopen(self):
         layer = self.gdb.create_layer(
@@ -655,6 +712,10 @@ class TestCreateLayerAndWrite(_TempGdbCase):
     def test_sync_is_idempotent(self):
         layer = self.gdb.create_layer('Y', geometry_type='point')
         layer.write_feature({'Shape': Geometry.from_wkt('POINT (1 2)')})
+        # ⚠️ 落盘口径:写要素**不**逐条落盘(照 GDAL 的脏标记做法),表头计数、
+        # 文件大小、索引头都攒到 sync()。所以这里必须先 sync 一次再记大小 ——
+        # 第一次 sync 会把挂起的东西写出去,文件是会长的(见 test_write_is_lazy)。
+        layer.sync()
         size = os.path.getsize(layer.path)
         for _ in range(3):
             layer.sync()
@@ -669,6 +730,222 @@ class TestCreateLayerAndWrite(_TempGdbCase):
             self.assertNotIn(guid, seen)
             seen.add(guid)
             self.assertEqual(len(guid), 38)
+
+
+# ======================================================================
+# 写路径是"懒"的:逐条不落盘、索引就地写、头部攒到 sync()
+# ======================================================================
+class TestLazyWritePath(_TempGdbCase):
+    """守着写路径的落盘口径(改成照 GDAL 的脏标记之后)。
+
+    对应关系:``FileGDBTable::CreateFeature`` / ``DeleteFeature`` 只写记录体
+    + **就地**写那一行的索引 + 置脏(``filegdbtable_write.cpp:1769/2035``),
+    表头计数、文件大小、索引头/trailer 攒到 ``FileGDBTable::Sync``(:198)。
+    这一组守三件容易悄悄退化的事:
+
+    1. 逐条写的代价不得随条数增长 —— 原来的 O(N²) 就是"每条都整份重写索引";
+    2. 没 sync 时,索引该在磁盘上的字节要已经在,而且文件结构合法;
+    3. 头部懒写**不能**让"崩后重开 + 追加"覆盖已有记录(GDAL 靠量文件避开)。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.gdb = OpenFileGDB.create(self.gdb_path())
+        self.addCleanup(self.gdb.close)
+
+    def _new_layer(self, name='L', fields=None):
+        if fields is None:
+            fields = [GdbField('V', FGFT_INT32)]
+        return self.gdb.create_layer(name, geometry_type=None, fields=fields)
+
+    def _tablx_bytes(self, layer) -> bytes:
+        """磁盘上的 ``.gdbtablx`` 原始字节(不是内存对象)。"""
+        with open(layer.table.tablx.path, 'rb') as f:
+            return f.read()
+
+    def _flush_raw(self, layer) -> None:
+        """只把就地写的缓冲交给 OS(不走 ``sync()``,头部因此仍是旧的)。"""
+        if layer.table._fp is not None:
+            layer.table._fp.flush()
+        if layer.table.tablx._fp is not None:
+            layer.table.tablx._fp.flush()
+
+    def _count_full_rewrites(self, layer) -> list:
+        """只数**这张表**的 ``GdbTablx.flush`` 调用。"""
+        from pyopenfilegdb import _gdbtablx as TX
+
+        target = os.path.normcase(os.path.abspath(layer.table.tablx.path))
+        calls: list = []
+        real = TX.GdbTablx.flush
+
+        def counting(self):
+            if os.path.normcase(os.path.abspath(self.path)) == target:
+                calls.append(1)
+            return real(self)
+
+        TX.GdbTablx.flush = counting
+        self.addCleanup(setattr, TX.GdbTablx, 'flush', real)
+        return calls
+
+    # ------------------------------------------------------------------
+    def test_writing_features_never_rewrites_the_whole_index(self):
+        """逐条写不整份重写索引 —— 这是 O(N²) 的根,退回去这条必红。"""
+        layer = self._new_layer()
+        calls = self._count_full_rewrites(layer)
+
+        for i in range(300):
+            layer.write_feature({'V': i})
+        self.assertEqual(calls, [], '写要素不该整份重写 .gdbtablx')
+
+        layer.sync()
+        self.assertEqual(len(calls), 1, 'sync() 才写一次索引')
+
+        for i in range(300, 1500):        # 跨过 1024 那一页
+            layer.write_feature({'V': i})
+        self.assertEqual(len(calls), 1, '再写 1200 条也不许整份重写')
+        layer.sync()
+        self.assertEqual(len(calls), 2)
+
+    def test_index_row_is_already_on_disk_before_sync(self):
+        """不 sync 也要能把该行的偏移看在磁盘上(就地写,GDAL WriteFeatureOffset)。"""
+        layer = self._new_layer()
+        layer.write_feature({'V': 1})
+        layer.write_feature({'V': 2})
+        self._flush_raw(layer)
+
+        tab = layer.table.tablx
+        data = self._tablx_bytes(layer)
+        off_size = tab.offset_size
+        self.assertEqual(get_uint32(data, 12), off_size, '头部 offset_size')
+        for row in (0, 1):
+            stored = int.from_bytes(
+                data[16 + off_size * row:16 + off_size * (row + 1)], 'little')
+            self.assertEqual(stored, tab.offset_for_row(row),
+                             '第 %d 行的偏移应该已经就地写进去了' % row)
+        # 头部计数还是旧的 —— 那正是"头部攒到 sync"的语义(GDAL 也这样,
+        # 见 filegdbtable_write.cpp:1870 只置 m_bDirtyTableXHeader)
+        self.assertEqual(get_uint32(data, 8), 0, 'sync 之前磁盘上的计数应落后')
+
+    def test_page_growth_keeps_the_index_file_structurally_valid(self):
+        """跨页时只补一页零,而且当场补好头部页数与 trailer。
+
+        这里比 GDAL 多做一步:GDAL 跨页只置 ``m_bDirtyTableXTrailer = true;
+        m_nOffsetTableXTrailer = 0``(``filegdbtable_write.cpp:1678-1679``),
+        头部页数和 trailer 都留到 ``Sync``;本库的读端会校验
+        ``n1024BlocksPresent`` 与 trailer 的 ``n1024BlocksBis`` 一致,所以两边
+        必须同时落,否则崩在跨页那一刻的文件就读不回来了。
+        """
+        layer = self._new_layer()
+        for i in range(1100):                # 跨过第一页
+            layer.write_feature({'V': i})
+        self._flush_raw(layer)
+
+        from pyopenfilegdb._gdbtablx import FEATURES_PER_PAGE, TABLX_HEADER_SIZE
+
+        tab = layer.table.tablx
+        data = self._tablx_bytes(layer)
+        self.assertEqual(tab.n_blocks_present, 2)
+        n_pages = get_uint32(data, 4)
+        self.assertEqual(n_pages, 2, '跨页时头部页数要当场跟上')
+        page_bytes = tab.offset_size * FEATURES_PER_PAGE
+        trail = TABLX_HEADER_SIZE + page_bytes * 2
+        self.assertEqual(get_uint32(data, trail), 0)         # nBitmapInt32Words
+        self.assertEqual(get_uint32(data, trail + 4), n_pages)   # nBitsForBlockMap
+        self.assertEqual(get_uint32(data, trail + 8), n_pages)   # n1024BlocksBis
+        self.assertEqual(len(data), trail + 16, '文件就该是 头+2页+trailer')
+        # 当场用读端把它解析一遍:头部页数与 trailer 不一致这里就会抛 GdbFormatError
+        from pyopenfilegdb._gdbtablx import GdbTablx
+
+        reread = GdbTablx.open(tab.path)
+        self.assertEqual(reread.n_blocks_present, 2)
+        self.assertEqual(reread.total_record_count, 0, '计数仍旧攒到 sync')
+
+    def test_delete_and_update_append_write_the_row_in_place(self):
+        """删除写 0、变大改写写新偏移 —— 两条都要当场进文件。"""
+        layer = self._new_layer(
+            fields=[GdbField('V', FGFT_INT32), GdbField('NOTE', FGFT_STRING, 255)])
+        for i in range(4):
+            layer.write_feature({'V': i, 'NOTE': 'a'})
+        layer.sync()
+
+        tab = layer.table.tablx
+        off_size = tab.offset_size
+        old3 = tab.offset_for_row(3)
+
+        layer.delete_feature(2)
+        self._flush_raw(layer)               # 不 sync,只看就地写的结果
+        data = self._tablx_bytes(layer)
+        row1 = int.from_bytes(data[16 + off_size:16 + 2 * off_size], 'little')
+        self.assertEqual(row1, 0, '删除的槽位必须当场写成 0')
+
+        feat = layer.read_feature(4)         # 顺带验证:删掉一条后还能读
+        feat.attributes['NOTE'] = 'x' * 200  # 撑大记录体 → 走"追写到末尾"那一支
+        layer.update_feature(feat)
+        self._flush_raw(layer)
+
+        data = self._tablx_bytes(layer)
+        row3 = int.from_bytes(data[16 + 3 * off_size:16 + 4 * off_size], 'little')
+        self.assertEqual(row3, tab.offset_for_row(3),
+                         '变大改写后的新偏移要当场写进去')
+        self.assertGreater(row3, old3, '变大 = 换到文件末尾的新偏移')
+        self.assertNotEqual(row3, 0)
+
+    def test_crash_without_sync_does_not_corrupt_records(self):
+        """头部懒写之后,"崩了再重开可写"不许把新记录写到老记录上面。
+
+        GDAL 在 ``filegdbtable.cpp:982-986`` 用 ``VSIFSeekL(0, SEEK_END)``
+        **量文件**而不是读表头,所以不会踩;本库照做。变异测试:把
+        ``GdbTable.open_for_write`` 里的 ``os.path.getsize`` 改回读表头
+        ``+24``,这条立刻红(新偏移会落在老记录体中间)。
+
+        顺带钉住"没 sync 就崩"这句话到底是什么语义:未 sync 的那批在重开
+        之后**看不见**(索引头部计数退回落盘点),所以重开追加是从旧槽位
+        接着写 —— 丢的是这批,不是已落盘的记录。要抗崩就得定期
+        :meth:`Layer.sync` / 写完结账。
+        """
+        layer = self._new_layer()
+        for i in range(20):
+            layer.write_feature({'V': i})
+        self._flush_raw(layer)               # 模拟崩溃:只到 OS,不走 sync
+
+        tab = layer.table.tablx
+        table_path = layer.table.path
+        start = tab.offset_for_row(0)        # 第一条记录的偏移 = 表头长度
+        with open(table_path, 'rb') as f:
+            before = f.read()
+        self.assertLess(get_uint64(before, 24), len(before),
+                        '这个测试的前提就是表头里的文件大小已经落后')
+
+        # 丢弃所有句柄(不 sync、不 close)
+        layer.table._fp.close()
+        layer.table._fp = None
+        tab.close()
+
+        gdb = OpenFileGDB.open(self.gdb_path(), update=True)
+        self.addCleanup(gdb.close)
+        lay = gdb.get_layer('L')
+        self.assertEqual(list(lay.read_features()), [],
+                         '未 sync 的那批崩溃后不可见(GDAL 同样的窗口)')
+        lay.write_feature({'V': 999})
+        # 追加点必须是**量出来的**真实文件末尾,而不是表头里那个落后的小值
+        self.assertEqual(lay.table.tablx.offset_for_row(0), len(before))
+        lay.sync()
+
+        with open(table_path, 'rb') as f:
+            after = f.read()
+        self.assertEqual(after[start:len(before)], before[start:],
+                         '老记录体被后来的追加盖掉了')
+        self.assertGreater(len(after), len(before))
+
+    def test_unsynced_records_are_invisible_to_another_handle(self):
+        """没 sync 时另一个句柄看不到新记录 —— 这是 GDAL 的语义,别当 bug 改回去。"""
+        layer = self._new_layer()
+        layer.write_feature({'V': 1})
+        with OpenFileGDB.open(self.gdb_path()) as other:
+            self.assertEqual(other.get_layer('L').record_count, 0)
+        layer.sync()
+        with OpenFileGDB.open(self.gdb_path()) as other:
+            self.assertEqual(other.get_layer('L').record_count, 1)
 
 
 # ======================================================================
