@@ -371,7 +371,6 @@ class GdbLayer:
         # (``filegdbtable_write.cpp:1769``)。落盘点见 :meth:`sync`。
         if isinstance(feature, GdbFeature):
             feature.oid = oid
-        self.table.sync()   # MUTATION-M1
         return oid
 
     def update_feature(self, feature: Any) -> None:

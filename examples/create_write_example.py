@@ -8,7 +8,9 @@
     python examples/create_write_example.py D:/tmp/out.gdb
 
 只用标准库 —— 本示例不需要 GDAL / fiona / pygdal。
-产出的库可以直接用 ArcGIS / QGIS 打开。
+产出的库可以直接用 ArcGIS / QGIS 打开(**写完之后要 close()**,或者用
+``with`` 退出 —— 写路径是懒落盘的,关句柄就是结账;急着让别人看见可以
+中途 ``layer.sync()``)。
 """
 from __future__ import annotations
 
@@ -124,6 +126,11 @@ def build(gdb_path: str) -> None:
     })
     print(f'已建图层: {gdb.list_feature_classes()}')
 
+    # ⚠️ 写是懒的(照 GDAL 的 FileGDBTable::CreateFeature):每条 write_feature
+    # 只写记录体和它那一行的索引(O(1)),头部计数 / 包围盒 / 索引尾部攒到
+    # 落盘点 —— close()、with 退出、或显式 gdb.sync()/layer.sync()。
+    # 所以**不 close 就退出**会留下一个半成品库;批量写完想立刻用另一个句柄
+    # (或 ArcGIS)读,也要先 sync()。
     gdb.close()
 
 

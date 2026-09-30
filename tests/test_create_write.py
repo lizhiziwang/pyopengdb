@@ -937,8 +937,53 @@ class TestLazyWritePath(_TempGdbCase):
                          '老记录体被后来的追加盖掉了')
         self.assertGreater(len(after), len(before))
 
+    def test_lazy_write_matches_the_full_rewrite_byte_for_byte(self):
+        """逐条就地写 + 收尾 sync,字节与"只 sync 一次"的批量路径完全一样。
+
+        A 库走 ``layer.write_feature``(记录体 + 就地写索引),B 库走表级
+        ``append_feature``(只置脏)最后 sync 一次 —— 两条路径落盘时机不同,
+        但结账后 ``.gdbtable`` / ``.gdbtablx`` 必须逐字节相同。这条同时守住
+        "``flush()`` 的字节输出不许改"(系统表那条 ArcGIS 对比用的是同一套
+        序列化代码)。
+        """
+        fields = [GdbField('V', FGFT_INT32), GdbField('NOTE', FGFT_STRING, 32)]
+
+        def build(path, use_layer_api):
+            gdb = OpenFileGDB.create(path)
+            try:
+                lay = gdb.create_layer('L', geometry_type='point', fields=fields)
+                for i in range(1500):        # 跨过 1024 那一页
+                    geom = Geometry.from_wkt('POINT (%d %d)' % (i + 1, i * 2 + 1))
+                    if use_layer_api:
+                        lay.write_feature({'V': i, 'NOTE': 'n%d' % i,
+                                           'Shape': geom})
+                    else:
+                        lay.table.append_feature(GdbFeature(
+                            attributes={'V': i, 'NOTE': 'n%d' % i},
+                            geometry=geom))
+                lay.sync()
+                stem = os.path.basename(lay.table.path)[:-len('.gdbtable')]
+            finally:
+                gdb.close()
+            return path, stem
+
+        a, stem_a = build(self.gdb_path('a.gdb'), True)
+        b, stem_b = build(self.gdb_path('b.gdb'), False)
+        self.assertEqual(stem_a, stem_b, '两边的物理表名不该不同')
+        for name in (stem_a + '.gdbtable', stem_a + '.gdbtablx'):
+            with open(os.path.join(a, name), 'rb') as f:
+                mine = f.read()
+            with open(os.path.join(b, name), 'rb') as f:
+                ref = f.read()
+            self.assertEqual(mine, ref, f'{name} 两条写路径的字节不一致')
+        with OpenFileGDB.open(a) as g:       # 顺带确认 A 库能读回来
+            self.assertEqual([f.attributes['V']
+                              for f in g.get_layer('L').read_features()],
+                             list(range(1500)))
+
     def test_unsynced_records_are_invisible_to_another_handle(self):
         """没 sync 时另一个句柄看不到新记录 —— 这是 GDAL 的语义,别当 bug 改回去。"""
+
         layer = self._new_layer()
         layer.write_feature({'V': 1})
         with OpenFileGDB.open(self.gdb_path()) as other:

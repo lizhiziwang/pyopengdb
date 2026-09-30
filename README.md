@@ -110,8 +110,24 @@ feat.attributes['POP'] = 301
 layer.update_feature(feat)
 
 layer.delete_feature(oid)
-gdb.close()
+gdb.close()                                          # ← 关闭 = 结账(必须)
 ```
+
+**写是懒落盘的**(照 GDAL 的 `FileGDBTable::CreateFeature`):每条
+`write_feature()` 当场写记录体 + **就地把这一行的索引写掉**(O(1)),头部计数 /
+包围盒 / 索引尾部攒到落盘点。落盘点是 `layer.sync()`、`layer.close()`、
+`gdb.close()`(或 `with` 退出)。所以:
+
+```python
+for i in range(100_000):                             # 批量:直接循环,别逐条 sync
+    layer.write_feature({'NAME': 'x%d' % i, 'Shape': geom})
+layer.sync()                                         # 一次结账 ≈ 0.012 ms/条
+```
+
+* **同一句柄写完立刻读得到**(读之前会先 sync);
+* **没 sync 时另一个句柄 / 另一个进程看不到**新记录 —— 这是有意的语义;
+* **不 close 就退出会留下半成品库**;崩在 `sync()` 之前,未落盘的那一批会丢
+  (GDAL 的窗口一模一样,它的答案是 `SyncToDisk()` / 事务)。
 
 改要素走 **读→改→写回**:`update_feature()` 是**整条记录替换**(对应 GDAL
 `ISetFeature`),`attributes` 里没提到的字段会按字段定义落默认值/空值 —— 所以
@@ -124,7 +140,8 @@ gdb.close()
 之后可以直接 `update_feature(feat)`;传 dict 则取返回值。字段定义里**没有**的
 键会被**静默忽略**,写错名字不会报错 —— 只会发现值没进去。
 
-建出来的库**可以直接用 ArcGIS / QGIS 打开** —— 七张系统表与真实 ArcGIS 空白库
+建出来的库**可以直接用 ArcGIS / QGIS 打开** —— **写完 `close()`(或 `with` 退出)
+之后**;七张系统表与真实 ArcGIS 空白库
 逐段字节一致(有测试守着)。
 
 ### 几何对象
@@ -300,6 +317,22 @@ multipatch 允许转(逐点操作,不依赖"环"模型,没有谓词那种语义�
 
 **单条几何的空间计算不在遍历循环里**:`area()` / `centroid()` 这类只对一条几何跑,
 大环上 numpy 快 ×21~25,小几何用纯 Python。
+
+### 写路径
+
+非空间单 int 字段表,`layer.write_feature()` 循环 + `layer.sync()` 一次(本机):
+
+| 条数 | 逐条写(每条就地写索引) | 表级批量 append + sync | ms/条 |
+|---:|---:|---:|---:|
+| 1,000 | 0.013 s | 0.013 s | 0.013 / 0.013 |
+| 4,000 | 0.047 s | 0.045 s | 0.012 / 0.011 |
+| 10,000 | 0.113 s | 0.104 s | 0.011 / 0.010 |
+
+耗时**与条数成正比**(整份重写索引的次数恒为 12,全是建库/收尾那几次)。改之前
+是每条都整份重写 `.gdbtablx`,10,000 条要 **33.5 s**(3.35 ms/条,而且 N 越大
+越坏)—— 同一条代码路径从 **297×** 提速到恒定的 ~0.012 ms/条。写法上没有别的
+花招:**直接 `write_feature` 循环,别绕到表级内部 API**(两条路径的字节输出
+逐位相同,有测试守着)。
 
 ⚠️ **性能必须在终端里测,不能按 PyCharm 的 Debug 跑。** PyCharm 的调试器给每个
 Python 帧装 line tracer,每条字节码回调一次 —— 本库是纯 Python,全额上税;
