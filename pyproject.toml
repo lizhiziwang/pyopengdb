@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyopenfilegdb"
+version = "0.1.0"
+description = "纯 Python 实现的 Esri FileGDB(.gdb)读写库,带可选的 C 加速模块"
+readme = "DESIGN.md"
+requires-python = ">=3.9"
+license = "MIT"
+keywords = ["gdb", "filegdb", "esri", "arcgis", "gis", "geospatial"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: GIS",
+]
+
+# ⚠️ 运行时依赖**仍然是零**。numpy 列在这里只是为了让它能被正式声明为
+# "可选加速器"(装上就用、不装就自动退回纯 Python),**不是**依赖:
+#   * 代码里是 `try: import numpy / except ImportError`,绝不硬 import;
+#   * ``PYOPENFILEGDB_NO_NUMPY=1`` 可在运行时强制关闭,便于差分验证;
+#   * 没有它,库的全部功能仍在,只是大几何的 area/length/centroid 慢一些。
+# 所以这里是 optional-dependencies,**不要**挪进 [project].dependencies。
+# 详见 DESIGN.md §2.21 与 tools/verify_numpy.py。
+[project.optional-dependencies]
+speed = ["numpy>=1.20"]
+
+# 只发布这一个包(顶层那些 tools_*.py / main.py / examples 不进 wheel)。
+[tool.setuptools]
+packages = ["pyopenfilegdb"]
+
+# sdist 里要带上 C 源码,否则从 sdist 安装时编不出扩展。
+[tool.setuptools.package-data]
+pyopenfilegdb = ["_gdbaccel.c"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

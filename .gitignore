@@ -1,0 +1,29 @@
+# ---- 虚拟环境 / 编辑器 / 缓存 ----
+.venv/
+.idea/
+.vscode/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# ---- 构建产物 ----
+# `build/` 是 setuptools 的构建树,**里面是一份过期的生成副本**
+# (build/lib.win-amd64-cpython-311/ 里的代码还是旧类名 GdbGeometry)。
+# 它既不该提交,也不该被当成当前代码看 —— 见 DESIGN.md §3。
+build/
+dist/
+*.egg-info/
+
+# ---- 可选 C 扩展(_gdbaccel)的编译产物 ----
+# 源码 `pyopenfilegdb/_gdbaccel.c` **要提交**,`.pyd`/.obj 不提交:
+# 它们绑解释器版本(cp311 / cp313 各一份),换机器/换解释器都要重编。
+# 编译方法见 ACCEL.md。
+*.pyd
+*.so
+*.obj
+*.lib
+*.exp
+
+# ---- 性能/验证工具的临时输出 ----
+*.prof
+.pytest_cache/
