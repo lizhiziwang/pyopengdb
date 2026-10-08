@@ -11,7 +11,7 @@ __pycache__/
 # (build/lib.win-amd64-cpython-311/ 里的代码还是旧类名 GdbGeometry)。
 # 它既不该提交,也不该被当成当前代码看 —— 见 DESIGN.md §3。
 build/
-dist/
+#dist/
 *.egg-info/
 
 # ---- 可选 C 扩展(_gdbaccel)的编译产物 ----
