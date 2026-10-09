@@ -38,7 +38,6 @@ def read():
     print(f"遍历完成,花费时间:{end - start}")
     ds.close()      # 只读也显式关掉,免得句柄挂着
 
-
 def test_geom_fun():
     '''
     测试空间计算
@@ -108,4 +107,5 @@ def test_update():
 if __name__ == '__main__':
     # test_geom_fun()
     # write()
-    test_update()
+    # test_update()
+    read()

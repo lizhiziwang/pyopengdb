@@ -47,9 +47,19 @@ decode_scalar_flat = _impl.decode_scalar_flat if HAS_ACCEL else None
 decode_xy = _impl.decode_xy if HAS_ACCEL else None
 decode_scalar = _impl.decode_scalar if HAS_ACCEL else None
 
+#: WKT 写出(点序列 -> ``"(...)"``)。落点是 :func:`_esri_geometry.to_wkt`
+#: 里的 ``seq_of`` —— 灌 PostgreSQL 这类"把几何导出去"的活儿,七成时间
+#: 在这里(见 DESIGN.md §2.19.6)。
+#:
+#: ⚠️ 它与上面四个入口的**失败口径不同**:缓冲不是 double 数组时**返回
+#: ``None``** 而不是抛异常(调用方收到 None 就退回纯 Python),其余情况
+#: 与纯 Python 逐字符相同、抛的错也同型。
+wkt_seq = _impl.wkt_seq if HAS_ACCEL else None
+
 #: 分派处要读的全部名字。加新入口时**必须**加进来,否则 :func:`use`
 #: 切不干净 —— 关掉加速后仍有一个入口是 C 的,"C 比纯 Python"就假了。
-_ENTRIES = ('decode_xy_flat', 'decode_scalar_flat', 'decode_xy', 'decode_scalar')
+_ENTRIES = ('decode_xy_flat', 'decode_scalar_flat', 'decode_xy',
+            'decode_scalar', 'wkt_seq')
 
 
 @contextlib.contextmanager
@@ -77,5 +87,5 @@ def use(enabled: bool = True):
 
 
 __all__ = ['HAS_ACCEL', 'decode_xy_flat', 'decode_scalar_flat',
-           'decode_xy', 'decode_scalar', 'use']
+           'decode_xy', 'decode_scalar', 'wkt_seq', 'use']
 

@@ -23,6 +23,11 @@
    对拍。参考实现把 C 的语义(接受域上限、64 位累加器绕回)用 Python 写死,
    所以能覆盖真实数据碰不到的垃圾输入。
 
+4. **WKT 出口对拍 + fuzz**(``wkt_seq``)。同一个 ``Geometry``,加速开/关各
+   导出一次,要求**逐字符相同**;另加一轮 fuzz,拿一份**独立写死**的
+   ``_fmt`` / ``seq_of`` 参考实现当参照,专打真实数据碰不到的浮点分支
+   (NaN / ±0.0 / ±inf / 1e15 两侧 / 次正规数)。
+
 ⚠️ 为什么 ``peek_envelope`` 不在对拍范围里
 ----------------------------------------
 它只读 blob 头部的 4 个 varuint,走的是另一条路径,**不经过**加速边界,
@@ -39,6 +44,7 @@
 from __future__ import annotations
 
 import glob
+import math
 import os
 import random
 import sys
@@ -56,6 +62,9 @@ from pyopenfilegdb._datatypes import GdbFormatError, _LazyGeometry  # noqa: E402
 
 #: 纯 Python 那条路最多解多少顶点(它才是瓶颈)。
 PY_VERTEX_BUDGET = 2_000_000
+#: WKT 出口对拍的顶点预算。比解码那条小两个数量级:纯 Python 的 WKT 出口
+#: 约 2.5 µs/顶点(见 DESIGN.md §2.19.6),200 万顶点要 5 s。
+WKT_VERTEX_BUDGET = 200_000
 #: 每条记录最多截成几个不同长度来试。
 TRUNC_SAMPLES = 8
 
@@ -471,6 +480,208 @@ def fuzz(rounds: int = 4000, seed: int = 20260929) -> int:
 
 
 # ----------------------------------------------------------------------
+# 4. WKT 出口对拍(纯 to_wkt 的 C 版:wkt_seq)
+# ----------------------------------------------------------------------
+def check_wkt_layer(ly, budget: list) -> tuple:
+    """返回 ``(比对条数, 比对顶点数, 不一致数, 错误信息列表)``。
+
+    几何**只解一次**(解码的等价性由 :func:`check_layer` 管),这里比的是
+    ``_esri_geometry.to_wkt`` 这条出口:同一个 ``Geometry`` 对象,加速开/关
+    各导出一次,**字符串必须逐字符相同**。
+
+    ⚠️ 只比字符串是不够严的 —— 但反过来也成立:``wkt_seq`` 的输出直接就是
+    返回值,没有中间容器可言,逐字符相同就是全部契约。真正要小心的是
+    **别拿被测代码当参照**(下面 fuzz_wkt 里那份参考实现是独立写死的)。
+    """
+    tab = ly.table
+    if tab is None or tab.geom_field is None:
+        return 0, 0, 0, []
+
+    n_cmp = n_vert = n_bad = 0
+    errs = []
+
+    for feat in ly.read_features():
+        if budget[0] <= 0:
+            break
+        raw = raw_of(feat)
+        if not raw:
+            continue
+        try:
+            with accel_enabled(True):
+                g, _pos = G.decode_geometry_ex(raw, 0, tab.geom_field,
+                                               tab.has_z, tab.has_m)
+                if g is None:
+                    continue
+                wkt_c = G.to_wkt(g)
+        except Exception:                              # noqa: BLE001
+            continue            # multipatch 等本来就导不出 WKT 的,跳过
+
+        with accel_enabled(False):
+            wkt_py = G.to_wkt(g)
+
+        n_cmp += 1
+        n_vert += n_vertices(g)
+        budget[0] -= n_vertices(g)
+        if wkt_c != wkt_py:
+            n_bad += 1
+            k = next((j for j in range(min(len(wkt_c), len(wkt_py)))
+                      if wkt_c[j] != wkt_py[j]), min(len(wkt_c), len(wkt_py)))
+            errs.append(
+                f'行 {feat.oid}: WKT 不同(第 {k} 个字符起)\n'
+                f'      C : ...{wkt_c[max(0, k - 40):k + 40]!r}\n'
+                f'      PY: ...{wkt_py[max(0, k - 40):k + 40]!r}')
+        if n_bad >= 5:
+            break
+
+    return n_cmp, n_vert, n_bad, errs
+
+
+# ----------------------------------------------------------------------
+# 5. WKT 出口 fuzz(C wkt_seq vs 独立参考实现)
+# ----------------------------------------------------------------------
+#: 专挑会踩到 _fmt 分支的浮点值。真实数据里**碰不到**这些(FileGDB 的坐标
+#: 是量化出来的有限小数),而 wkt_seq 的每一条分支都要在这里被走到:
+#: NaN / ±0.0 / ±inf / 1e15 那道整数判据的两侧 / 指数形式 / 次正规数。
+_NASTY = [
+    0.0, -0.0, 1.0, -1.0,
+    float('nan'), float('inf'), float('-inf'),
+    1e15, -1e15, 1e15 - 1, math.nextafter(1e15, 0.0), 999999999999999.0,
+    1e16, 1e21, 1e300, 1e-300, 5e-324, -5e-324, 2.2250738585072014e-308,
+    116.39712800000001, 0.1, 1 / 3, -2.5, 3.5,
+]
+
+
+def ref_wkt_seq(xy, z, m, close: bool, point_parens: bool) -> str:
+    """``to_wkt`` 里 ``seq_of`` 的语义,独立写死一份当参照。
+
+    ⚠️ **不要改成调用 _esri_geometry 里的任何东西** —— 那样就成了拿被测
+    代码给被测代码当参照,闸门立刻失效。这里连 ``_fmt`` 都是重写的。
+
+    ``inf`` 的处理是**故意**让它自然抛的:``int(float('inf'))`` 抛
+    OverflowError,而这正是纯 Python 的 ``_fmt`` 碰到 inf 时的真实行为。
+    """
+    n = len(xy) // 2
+    if z is not None and len(z) < n:
+        raise IndexError('z 比点数短')
+    if m is not None and len(m) < n:
+        raise IndexError('m 比点数短')
+
+    def fmt(v: float) -> str:
+        if v != v:
+            return 'NaN'
+        if v == int(v) and abs(v) < 1e15:
+            return str(int(v))
+        return repr(v)                                  # inf 在这行抛
+
+    def point(k: int) -> str:
+        parts = [fmt(xy[2 * k]), fmt(xy[2 * k + 1])]
+        if z is not None:
+            parts.append(fmt(z[k]))
+        if m is not None:
+            parts.append(fmt(m[k]))
+        body = ' '.join(parts)
+        return '(' + body + ')' if point_parens else body
+
+    body = ', '.join(point(k) for k in range(n))
+    if close and n >= 1:                # 原条件是 len(a) >= 2,即至少一个点
+        body += ', ' + fmt(xy[0]) + ' ' + fmt(xy[1])
+        if z is not None:
+            body += ' ' + fmt(z[0])
+        if m is not None:
+            body += ' ' + fmt(m[0])
+    return '(' + body + ')'
+
+
+def fuzz_wkt(rounds: int = 20000, seed: int = 20261009) -> int:
+    print(f'\n=== WKT 出口 fuzz({rounds} 轮,wkt_seq vs 参考实现) ===')
+    if not _accel.HAS_ACCEL:
+        print('  没有加速模块,跳过')
+        return 0
+    import pyopenfilegdb._gdbaccel as m
+
+    rnd = random.Random(seed)
+    bad = 0
+    n_fb = n_short = 0             # 记一下"退回避让"和"长度不齐"各走到几次
+
+    def call(fn, *a):
+        try:
+            return None, fn(*a)
+        except Exception as e:                         # noqa: BLE001
+            return type(e).__name__, None
+
+    for i in range(rounds):
+        n = rnd.randrange(0, 6)
+
+        def val():
+            r = rnd.random()
+            if r < 0.35:
+                return rnd.choice(_NASTY)
+            if r < 0.6:
+                return float(rnd.randrange(-10**15, 10**15))
+            if r < 0.8:
+                return rnd.uniform(-1e7, 1e7)
+            # 后半段混一些"短表示很长"的值(repr 要十几个字符)
+            return rnd.choice((rnd.random() * 10.0 ** rnd.randrange(-12, 12),
+                               float(rnd.randrange(-999, 999))
+                               / 2 ** rnd.randrange(1, 20)))
+
+        xy = array('d', [val() for _ in range(2 * n)])
+        z_on, m_on = rnd.choice(((False, False), (True, False),
+                                 (False, True), (True, True)))
+        z = array('d', [val() for _ in range(n)]) if z_on else None
+        mm = array('d', [val() for _ in range(n)]) if m_on else None
+        close = rnd.choice((False, True))
+        point_parens = rnd.choice((False, True))
+        if close and point_parens:
+            # 这两个不会一起用:close 是环(裸点)、point_parens 是多点(带
+            # 括号的点)。库里的调用点不会这么组合,不拿它当契约。
+            point_parens = False
+
+        err, got = call(m.wkt_seq, xy, z, mm, close, point_parens)
+        werr, want = call(ref_wkt_seq, xy, z, mm, close, point_parens)
+
+        if err != werr:
+            bad += 1
+            print(f'  ✗ #{i} 异常不同 C={err} 参考={werr} '
+                  f'xy={list(xy)!r} z={z} m={mm} close={close} '
+                  f'paren={point_parens}')
+        elif err is None and got != want:
+            bad += 1
+            print(f'  ✗ #{i} 结果不同\n      C  : {got!r}\n'
+                  f'      参考: {want!r}')
+        if bad >= 5:
+            break
+
+        # 定向:z 比点数短 -> 两条路都得是 IndexError(与 z[i] 越界同型)。
+        if i % 13 == 0 and n > 0:
+            zs = array('d', [1.0] * (n - 1))
+            err, _g = call(m.wkt_seq, xy, zs, None, close, False)
+            werr, _w = call(ref_wkt_seq, xy, zs, None, close, False)
+            n_short += 1
+            if err != werr:
+                bad += 1
+                print(f'  ✗ #{i} z 短一截:异常不同 C={err} 参考={werr}')
+
+        # 定向:非 double 缓冲必须**返回 None**(不是抛错)—— 那是"退回
+        # 纯 Python"的信号,库靠它保证 list 之类的输入仍由 Python 报错。
+        if i % 17 == 0:
+            for badarg in ([1.0, 2.0], (0.0, 0.0), b'12345678',
+                           array('f', [1.0, 2.0]), memoryview(b'12345678')):
+                r = m.wkt_seq(badarg, None, None, False, False)
+                n_fb += 1
+                if r is not None:
+                    bad += 1
+                    print(f'  ✗ #{i} 非 double 缓冲 {type(badarg).__name__} '
+                          f'返回了 {r!r},应为 None')
+        if bad >= 5:
+            break
+
+    print(f'  {"✓ 全部一致" if not bad else f"✗ {bad} 处不一致"}'
+          f'(退回避让 {n_fb} 次 / 长度不齐 {n_short} 次)')
+    return bad
+
+
+# ----------------------------------------------------------------------
 def collect_real_blobs(cands: list, limit: int = 3) -> list:
     """抓几个真实几何 blob,给截断用例用。"""
     out = []
@@ -514,10 +725,11 @@ def main() -> int:
 
     bad = run_crafted(real_blobs)
     bad += fuzz()
+    bad += fuzz_wkt()
 
     print(f'\n=== 真实数据对拍(纯 Python 顶点预算 '
           f'{"∞" if do_all else f"{PY_VERTEX_BUDGET:,}"}) ===')
-    tot_cmp = tot_vert = 0
+    tot_cmp = tot_vert = tot_wkt_cmp = tot_wkt_vert = 0
     for gdb_path in cands:
         try:
             gdb = OpenFileGDB.open(gdb_path)
@@ -538,9 +750,23 @@ def main() -> int:
             print(f'  {mark} {name:20s} 比对 {n_cmp:6d} 条 / {n_vert:9,d} 顶点')
             for e in errs:
                 print(f'      {e}')
+
+            # WKT 出口:与解码分开记账,预算也分开(单价高得多)。
+            w_cmp, w_vert, w_bad, w_errs = check_wkt_layer(
+                ly, [WKT_VERTEX_BUDGET if not do_all else float('inf')])
+            tot_wkt_cmp += w_cmp
+            tot_wkt_vert += w_vert
+            bad += w_bad
+            if w_cmp or w_bad:
+                mark = '✓' if not w_bad else '✗'
+                print(f'    {mark} WKT      比对 {w_cmp:6d} 条 / '
+                      f'{w_vert:9,d} 顶点')
+            for e in w_errs:
+                print(f'      {e}')
         gdb.close()
 
-    print(f'\n合计:比对 {tot_cmp:,} 条 / {tot_vert:,} 顶点')
+    print(f'\n合计:几何比对 {tot_cmp:,} 条 / {tot_vert:,} 顶点;'
+          f'WKT 比对 {tot_wkt_cmp:,} 条 / {tot_wkt_vert:,} 顶点')
     print('全部一致 ✓' if not bad else f'⚠️ 有 {bad} 处不一致')
     return 1 if bad else 0
 

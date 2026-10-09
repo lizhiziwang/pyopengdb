@@ -874,17 +874,31 @@ def to_wkt(geom: Optional[Geometry]) -> str:
     def m_at(i):
         return None if ms is None else ms[i]
 
-    def seq_of(i, close):
+    def seq_of(i, close, point_parens=False):
         a = parts[i]
+        z = z_at(i)
+        m = m_at(i)
+        # 点序列的逐坐标格式化是整个 WKT 出口的热点(实测占七成以上,
+        # 见 DESIGN.md §2.19.6),交给 C 拓展做;返回 None 表示"这段缓冲
+        # 不是 double 数组",那就走下面的纯 Python 版本。
+        if _accel.wkt_seq is not None:
+            out = _accel.wkt_seq(a, z, m, close, point_parens)
+            if out is not None:
+                return out
+        if point_parens:
+            # MULTIPOINT:点本身在 WKT 里带括号,见 _pt_wkt_flat。
+            body = ', '.join(_pt_wkt_flat(a, k, z, m)
+                             for k in range(len(a) // 2))
+            return '(' + body + ')'
         # ⚠️ **不带括号** —— WKT 里边和环就是"点、逗号、点"。
         # 用 ``_pt_wkt_flat`` 会产出 ``LINESTRING ((0 0), (10 10))`` 和
         # ``POLYGON (((0 0), ...))``,两者都是**非法 WKT**,连本库自己的
         # ``from_wkt`` 都读不回来(实测)。
-        body = ', '.join(_pt_wkt_bare(a, k, z_at(i), m_at(i))
+        body = ', '.join(_pt_wkt_bare(a, k, z, m)
                          for k in range(len(a) // 2))
         if close and len(a) >= 2:
             # OGC WKT 要求环闭合;内存里的环不存闭合点
-            body += ', ' + _pt_wkt_bare(a, 0, z_at(i), m_at(i))
+            body += ', ' + _pt_wkt_bare(a, 0, z, m)
         return '(' + body + ')'
 
     if kind == 'point':
@@ -896,10 +910,7 @@ def to_wkt(geom: Optional[Geometry]) -> str:
     if kind == 'multipoint':
         if not parts or not parts[0]:
             return 'MULTIPOINT' + tag + ' EMPTY'
-        a = parts[0]
-        return ('MULTIPOINT' + tag + ' (' + ', '.join(
-            _pt_wkt_flat(a, k, z_at(0), m_at(0))
-            for k in range(len(a) // 2)) + ')')
+        return 'MULTIPOINT' + tag + ' ' + seq_of(0, False, point_parens=True)
 
     if kind not in ('polyline', 'polygon'):
         return 'GEOMETRYCOLLECTION EMPTY'

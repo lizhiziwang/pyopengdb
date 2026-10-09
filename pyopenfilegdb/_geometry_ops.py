@@ -482,6 +482,17 @@ def organize_polygons(parts: Sequence[Any],
     n = len(parts)
     if not n:
         return []
+    if n == 1:
+        # 单环面:答案**与绕向无关**,恒为"这一个环就是外环、没有洞"。走下面的
+        # 通用路径也一样 —— ``is_shell`` 无论算出什么,要么它就是唯一的外环,
+        # 要么被 ``not any(is_shell)`` / "洞找不到归属" 两条回退改成外环,三条
+        # 路都落到 ``[(0, [])]``;而 ``point_in_ring`` 那层根本不会被执行(没有洞)。
+        # 省掉的是每条环的 ``ring_signed_area2``(逐顶点,见 ring_signed_area2)。
+        #
+        # ⚠️ 这条捷径值得留:**实测面图层里绝大多数要素是单环**
+        # (``村行政区划`` 2000 条里 1926 条只有一个环),而环组装占
+        # ``Geometry.wkt()`` 的约三成 —— 数字见 DESIGN.md §2.19.6。
+        return [(0, [])]
     if shells is not None and len(shells) == n:
         is_shell = list(shells)
     else:
